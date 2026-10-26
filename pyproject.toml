@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pre-commit", "ruff==0.17.2"]
+dev = ["pre-commit", "pytest>=9.1", "ruff==0.17.2"]
 
 [tool.uv]
 package = false
@@ -21,3 +21,7 @@ archipelago = { git = "https://github.com/FYP-Archipelago/archipelago", rev = "b
 
 [tool.ruff]
 line-length = 150
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
