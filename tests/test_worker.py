@@ -1,0 +1,155 @@
+import json
+import threading
+import time
+from typing import Any
+
+import pytest
+import redis
+from archipelago import ClusterStream, Config, cluster_run
+
+from app.worker import __main__ as worker_main
+from app.worker import jobs
+from tests.conftest import SYNTHETIC_RUN_ID, push_logs, without_elapsed
+
+CONFIG = Config(lsh=True, birch=True, denstream=True)
+CLUSTERED = f"run:{SYNTHETIC_RUN_ID}:clustered"
+
+
+# the synthetic run is short, so let streamed runs go live early and produce real updates
+@pytest.fixture(autouse=True)
+def short_warm_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("archipelago.stream.WARMUP_ROWS", 50)
+
+
+def split_logs(entries: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    return [e["data"] for e in entries if e["kind"] == "row"], [e["data"] for e in entries if e["kind"] == "event"]
+
+
+def stream_id(entry_id: bytes) -> tuple[int, int]:
+    ms, seq = entry_id.split(b"-")
+    return int(ms), int(seq)
+
+
+def clustered(client: redis.Redis) -> list[dict[bytes, bytes]]:
+    return [fields for _, fields in client.xrange(CLUSTERED)]
+
+
+def entry(kind: str, data: dict[str, Any], entry_id: str) -> tuple[bytes, dict[bytes, bytes]]:
+    return entry_id.encode(), {b"kind": kind.encode(), b"data": json.dumps(data).encode()}
+
+
+def test_batch_job_result_equals_the_module(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
+
+    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, False, CONFIG.model_dump_json().encode())
+
+    [only] = clustered(sync_redis)
+    assert without_elapsed(only[b"final"]) == without_elapsed(cluster_run(*split_logs(log_entries), CONFIG).model_dump_json())
+
+
+def test_streamed_job_result_equals_the_module(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
+    reference = ClusterStream(CONFIG)
+    reference.cluster(*split_logs(log_entries))
+
+    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, True, CONFIG.model_dump_json().encode())
+
+    entries = clustered(sync_redis)
+    assert all(b"update" in e and b"covers" in e for e in entries[:-1])
+    assert without_elapsed(entries[-1][b"final"]) == without_elapsed(reference.finish().model_dump_json())
+
+
+# A worker that crashed after its update covering entry N must, on re-claim, rebuild its state
+# from the logs up to N without writing anything, then carry on and reach the same final result.
+def test_streamed_job_recovers_from_its_last_update(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
+    ids = push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
+    covered = ids[len(ids) // 2]
+    sync_redis.xadd(CLUSTERED, {"covers": covered, "update": "{}"})
+    reference = ClusterStream(CONFIG)
+    reference.cluster(*split_logs(log_entries))
+
+    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, True, CONFIG.model_dump_json().encode())
+
+    entries = clustered(sync_redis)
+    assert entries[0] == {b"covers": covered, b"update": b"{}"}
+    new_covers = [stream_id(e[b"covers"]) for e in entries[1:-1]]
+    assert new_covers and new_covers[0] > stream_id(covered) and new_covers == sorted(set(new_covers))
+    assert new_covers[-1] == stream_id(ids[-1])
+    assert without_elapsed(entries[-1][b"final"]) == without_elapsed(reference.finish().model_dump_json())
+
+
+def test_finished_job_is_not_redone(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
+    sync_redis.xadd(CLUSTERED, {"phase": "runner", "error": "island 3 crashed"})
+
+    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, True, CONFIG.model_dump_json().encode())
+
+    assert len(clustered(sync_redis)) == 1
+
+
+@pytest.mark.parametrize(
+    ("terminator", "failure", "ended"),
+    [
+        (entry("abort", {"error": "runner unreachable"}, "3-0"), "runner unreachable", False),
+        (entry("event", {"type": "run_end", "termination_reason": "error", "error": "island 3 crashed"}, "3-0"), "island 3 crashed", False),
+        (entry("event", {"type": "run_end", "termination_reason": "error"}, "3-0"), "runner failed", False),
+        (entry("event", {"type": "run_end", "termination_reason": "budget"}, "3-0"), None, True),
+    ],
+)
+def test_first_terminator_wins(terminator: tuple[bytes, dict[bytes, bytes]], failure: str | None, ended: bool) -> None:
+    before = [entry("row", {"seq": 1}, "1-0"), entry("event", {"type": "generation_end"}, "2-0")]
+    after = [entry("row", {"seq": 2}, "4-0"), entry("abort", {"error": "late"}, "5-0")]
+
+    chunk = jobs.split([*before, terminator, *after])
+
+    assert (chunk.failure, chunk.ended, chunk.last_id) == (failure, ended, b"3-0")
+    assert len(chunk.rows) == 1
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_job_reports_the_runners_failure(sync_redis: redis.Redis, log_entries: list[dict[str, Any]], stream: bool) -> None:
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries[:200])
+    sync_redis.xadd(f"run:{SYNTHETIC_RUN_ID}:runner_logs", {"kind": "abort", "data": json.dumps({"error": "island 3 crashed"})})
+
+    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, stream, CONFIG.model_dump_json().encode())
+
+    assert clustered(sync_redis)[-1] == {b"phase": b"runner", b"error": b"island 3 crashed"}
+
+
+def test_job_fails_when_logs_stop(sync_redis: redis.Redis, log_entries: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(jobs, "IDLE_TIMEOUT_SECONDS", 1)
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries[:200])
+
+    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, False, CONFIG.model_dump_json().encode())
+
+    assert clustered(sync_redis) == [{b"phase": b"runner", b"error": b"no logs for 1 s"}]
+
+
+def test_clustering_error_is_reported_not_raised(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
+    without_run_start = [e for e in log_entries if e["data"].get("type") != "run_start"]
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, without_run_start)
+
+    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, False, CONFIG.model_dump_json().encode())
+
+    [error] = clustered(sync_redis)
+    assert error[b"phase"] == b"clustering"
+
+
+# A plain XCLAIM adds a delivery on every beat, which would make a crashed job look like it had
+# already failed 3 times and skip recovery.
+def test_heartbeat_keeps_the_delivery_count_at_one(sync_redis: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker_main, "HEARTBEAT_SECONDS", 0.05)
+    sync_redis.xgroup_create("pending_runs", "workers", id="0", mkstream=True)
+    job_id = sync_redis.xadd("pending_runs", {"run_id": SYNTHETIC_RUN_ID, "stream": "true", "config": "{}"})
+    sync_redis.xreadgroup("workers", "w1", {"pending_runs": ">"}, count=1)
+    stop = threading.Event()
+    beat = threading.Thread(target=worker_main.heartbeat, args=(sync_redis, "w1", job_id, stop))
+
+    beat.start()
+    time.sleep(0.5)
+    stop.set()
+    beat.join()
+
+    [pending] = sync_redis.xpending_range("pending_runs", "workers", "-", "+", 10)
+    assert pending["times_delivered"] == 1
+    assert pending["time_since_delivered"] < 200
