@@ -1,0 +1,23 @@
+[project]
+name = "archipelago-backend"
+version = "0.2.0"
+description = "Backend for Archipelago: runs, live clustering over Redis streams, results in Postgres"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+  "archipelago", "fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27",
+  "psycopg[binary]>=3.2", "psycopg-pool>=3.2", "redis>=5.0",
+]
+
+[dependency-groups]
+dev = ["pre-commit", "ruff==0.17.2"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+archipelago = { git = "https://github.com/FYP-Archipelago/archipelago", rev = "bb3ac220c4916ca51a5f3a585f556f20e0d71b4b" }
+
+[tool.ruff]
+line-length = 150

@@ -1,14 +1,8 @@
 __pycache__/
 *.py[cod]
 .venv/
-venv/
+.ruff_cache/
 .DS_Store
-
-# Uploaded runs and written artifacts. Scratch: a job is a pure function of a
-# run directory and a config, so nothing in here is worth keeping.
-work/
-
-# Editor / tooling
 .vscode/
 .idea/
-.pytest_cache/
+.env
