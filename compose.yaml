@@ -6,7 +6,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
       POSTGRES_DB: archipelago
     volumes: [pgdata:/var/lib/postgresql/data]
-    ports: ["5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U archipelago"]
       interval: 2s
@@ -30,11 +29,32 @@ services:
       STORE_PATH: /app
       MASTERPASS: ${DRIZZLE_MASTERPASS:?}
     volumes: [drizzle:/app]
-    ports: ["4983:4983"]
+    ports: ["127.0.0.1:4983:4983"]
   redisinsight:
     image: redis/redisinsight:latest
     volumes: [redisinsight:/data]
-    ports: ["5540:5540"]
+    ports: ["127.0.0.1:5540:5540"]
+  api:
+    build: .
+    environment:
+      ARCHIPELAGO_DATABASE_URL: postgresql://archipelago:${POSTGRES_PASSWORD}@db:5432/archipelago
+      ARCHIPELAGO_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      ARCHIPELAGO_RUNNER_URL: ${ARCHIPELAGO_RUNNER_URL:?}
+      ARCHIPELAGO_CORS_ORIGINS: ${ARCHIPELAGO_CORS_ORIGINS:-*}
+    ports: ["8000:8000"]
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      ARCHIPELAGO_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+    depends_on:
+      redis: {condition: service_healthy}
+    deploy: {replicas: 2}
+    restart: unless-stopped
 volumes:
   pgdata: {}
   redisdata: {}

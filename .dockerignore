@@ -1,0 +1,7 @@
+.git
+.venv
+.env
+local
+PLAN.md
+**/__pycache__
+.ruff_cache

@@ -25,28 +25,16 @@ This is its backend. It starts runs on the runner service, hands each run's logs
    uv run pre-commit install
    ```
 
-4. Create your local `.env` from the example (dev values; set real passwords on a server):
+4. Create your local `.env` from the example (dev values; use long random passwords on a server):
 
    ```bash
    cp .env.example .env
    ```
 
-5. Start Postgres and Redis (plus the Drizzle Gateway and RedisInsight viewers):
+5. Start everything (Postgres, Redis, the API on port 8000, two clustering workers, and the Drizzle Gateway and RedisInsight viewers):
 
    ```bash
-   docker compose up -d
-   ```
-
-6. Run the API:
-
-   ```bash
-   uv run --env-file .env uvicorn app.main:app --reload --port 8000
-   ```
-
-7. Run the clustering workers, one per terminal (two by default):
-
-   ```bash
-   uv run --env-file .env python -m app.worker
+   docker compose up -d --build
    ```
 
 ## LICENSE
