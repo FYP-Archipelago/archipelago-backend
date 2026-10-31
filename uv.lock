@@ -36,7 +36,7 @@ wheels = [
 [[package]]
 name = "archipelago"
 version = "0.3.0"
-source = { git = "https://github.com/FYP-Archipelago/archipelago#b7228d77576ca36ff15ea1e61cd64ea1e778b93d" }
+source = { git = "https://github.com/FYP-Archipelago/archipelago#5468c5b44b7ed6750cb9cc40fbb2f5aa06508e14" }
 dependencies = [
     { name = "numpy" },
     { name = "pydantic" },
