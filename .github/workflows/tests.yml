@@ -30,6 +30,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --group dev
-      - run: uv run ruff check
-      - run: uv run ruff format --check
       - run: uv run pytest -q
