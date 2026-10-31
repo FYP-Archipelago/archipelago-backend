@@ -43,6 +43,29 @@ This is the backend for Archipelago. It starts runs on the runner service, hands
    docker compose --profile dev up -d --build
    ```
 
+## Tests
+
+1. The tests require Postgres and Redis to be running:
+
+   ```bash
+   docker run -d --rm --name test-pg -p 127.0.0.1:55432:5432 -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test postgres:16-alpine
+   docker run -d --rm --name test-redis -p 127.0.0.1:56379:6379 redis:7-alpine
+   ```
+
+2. Wait a few seconds for the containers to start, then run:
+
+   ```bash
+   export ARCHIPELAGO_TEST_DATABASE_URL=postgresql://test:test@localhost:55432/test
+   export ARCHIPELAGO_TEST_REDIS_URL=redis://localhost:56379/0
+   uv run pytest
+   ```
+
+3. Stop the containers when you are done:
+
+   ```bash
+   docker stop test-pg test-redis
+   ```
+
 ## LICENSE
 
 The project is licensed under the [MIT License](LICENSE).

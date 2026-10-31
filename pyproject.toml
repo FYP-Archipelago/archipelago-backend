@@ -17,7 +17,7 @@ dev = ["pre-commit", "pytest>=9.1", "ruff==0.17.2"]
 package = false
 
 [tool.uv.sources]
-archipelago = { git = "https://github.com/FYP-Archipelago/archipelago", rev = "bb3ac220c4916ca51a5f3a585f556f20e0d71b4b" }
+archipelago = { git = "https://github.com/FYP-Archipelago/archipelago" }
 
 [tool.ruff]
 line-length = 150

@@ -36,7 +36,7 @@ wheels = [
 [[package]]
 name = "archipelago"
 version = "0.3.0"
-source = { git = "https://github.com/FYP-Archipelago/archipelago?rev=bb3ac220c4916ca51a5f3a585f556f20e0d71b4b#bb3ac220c4916ca51a5f3a585f556f20e0d71b4b" }
+source = { git = "https://github.com/FYP-Archipelago/archipelago#b7228d77576ca36ff15ea1e61cd64ea1e778b93d" }
 dependencies = [
     { name = "numpy" },
     { name = "pydantic" },
@@ -66,7 +66,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "archipelago", git = "https://github.com/FYP-Archipelago/archipelago?rev=bb3ac220c4916ca51a5f3a585f556f20e0d71b4b" },
+    { name = "archipelago", git = "https://github.com/FYP-Archipelago/archipelago" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
