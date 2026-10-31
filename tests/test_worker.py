@@ -93,6 +93,11 @@ def test_finished_job_is_not_redone(sync_redis: redis.Redis, log_entries: list[d
         (entry("abort", {"error": "runner unreachable"}, "3-0"), "runner unreachable", False),
         (entry("event", {"type": "run_end", "termination_reason": "error", "error": "island 3 crashed"}, "3-0"), "island 3 crashed", False),
         (entry("event", {"type": "run_end", "termination_reason": "error"}, "3-0"), "runner failed", False),
+        (
+            entry("event", {"type": "run_end", "termination_reason": "time_limit", "error": "time limit of 3600 s"}, "3-0"),
+            "time limit of 3600 s",
+            False,
+        ),
         (entry("event", {"type": "run_end", "termination_reason": "budget"}, "3-0"), None, True),
     ],
 )

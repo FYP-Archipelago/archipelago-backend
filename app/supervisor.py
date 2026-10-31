@@ -149,6 +149,9 @@ async def _poll_runner(state: _RunState) -> None:
     elif polled.state == "failed":
         state.runner_done = True
         await queries.set_failed(state.pool, state.run_id, "runner", polled.error or "runner failed")
+    elif polled.state == "cancelled":
+        state.runner_done = True
+        await queries.set_failed(state.pool, state.run_id, "runner", "run cancelled")
     elif polled.state == "unknown":
         state.runner_done = True
         await queries.set_failed(state.pool, state.run_id, "runner", "runner has no record of this run")

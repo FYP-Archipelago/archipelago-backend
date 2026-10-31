@@ -104,7 +104,7 @@ async def test_streams_expire_only_after_the_runner_stopped(api: httpx.AsyncClie
 
     assert not await streams_expired(run_id)
     assert runner.calls.count(f"POST /runs/{run_id}/cancel") == 1
-    runner.state, runner.error = "failed", "cancelled"
+    runner.state, runner.error = "cancelled", None
     await wait_for(lambda: streams_expired(run_id))
     run = await queries.get_run(app.state.pool, run_id)
     assert run is not None and run.error is not None and (run.error.phase, run.error.message) == ("clustering", "bad genome")

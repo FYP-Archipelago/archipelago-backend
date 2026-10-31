@@ -8,7 +8,7 @@ RUNNER_TIMEOUT_SECONDS = 10
 
 logger = logging.getLogger(__name__)
 
-RunnerState = Literal["queued", "running", "finished", "failed", "unknown"]
+RunnerState = Literal["queued", "running", "finished", "failed", "cancelled", "unknown"]
 
 
 @dataclass(frozen=True)

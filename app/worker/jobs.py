@@ -42,7 +42,7 @@ def split(entries: list[Entry]) -> Chunk:
         elif kind == EVENT:
             chunk.events.append(data)
             if data.get("type") == "run_end":
-                if data.get("termination_reason") == "error":
+                if data.get("termination_reason") in ("error", "time_limit"):
                     chunk.failure = data.get("error") or "runner failed"
                 else:
                     chunk.ended = True
