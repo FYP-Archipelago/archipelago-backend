@@ -1,7 +1,7 @@
 [project]
 name = "archipelago-backend"
 version = "0.2.0"
-description = "Backend for Archipelago: runs, live clustering over Redis streams, results in Postgres"
+description = "Backend for Archipelago: explainability platform for island-model distributed Evolutionary Algorithms"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"

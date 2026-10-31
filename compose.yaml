@@ -22,18 +22,6 @@ services:
       test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping"]
       interval: 2s
       retries: 15
-  drizzle:
-    image: ghcr.io/drizzle-team/gateway:latest
-    environment:
-      PORT: 4983
-      STORE_PATH: /app
-      MASTERPASS: ${DRIZZLE_MASTERPASS:?}
-    volumes: [drizzle:/app]
-    ports: ["127.0.0.1:4983:4983"]
-  redisinsight:
-    image: redis/redisinsight:latest
-    volumes: [redisinsight:/data]
-    ports: ["127.0.0.1:5540:5540"]
   api:
     build: .
     environment:
@@ -55,6 +43,22 @@ services:
       redis: {condition: service_healthy}
     deploy: {replicas: 2}
     restart: unless-stopped
+
+  drizzle:
+    profiles: [dev]
+    image: ghcr.io/drizzle-team/gateway:latest
+    environment:
+      PORT: 4983
+      STORE_PATH: /app
+      MASTERPASS: ${DRIZZLE_MASTERPASS:-}
+    volumes: [drizzle:/app]
+    ports: ["127.0.0.1:4983:4983"]
+  redisinsight:
+    profiles: [dev]
+    image: redis/redisinsight:latest
+    volumes: [redisinsight:/data]
+    ports: ["127.0.0.1:5540:5540"]
+
 volumes:
   pgdata: {}
   redisdata: {}
