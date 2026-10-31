@@ -135,6 +135,63 @@ def test_clustering_error_is_reported_not_raised(sync_redis: redis.Redis, log_en
     assert error[b"phase"] == b"clustering"
 
 
+def enqueue(client: redis.Redis) -> bytes:
+    client.xgroup_create("pending_runs", "workers", id="0", mkstream=True)
+    return client.xadd("pending_runs", {"run_id": SYNTHETIC_RUN_ID, "stream": "false", "config": CONFIG.model_dump_json()})
+
+
+def test_finished_job_is_acked_and_deleted(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
+    enqueue(sync_redis)
+
+    worker_main.process_next(sync_redis, "w1")
+
+    assert b"final" in clustered(sync_redis)[-1]
+    assert sync_redis.xlen("pending_runs") == 0
+    assert sync_redis.xpending("pending_runs", "workers")["pending"] == 0
+
+
+def test_job_that_raised_stays_pending_and_is_reclaimed(
+    sync_redis: redis.Redis, log_entries: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
+    enqueue(sync_redis)
+    monkeypatch.setattr(worker_main, "CLAIM_IDLE_MS", 0)
+    run_job = worker_main.run_job
+
+    def crash(*args: Any) -> None:
+        raise RuntimeError("worker crashed")
+
+    monkeypatch.setattr(worker_main, "run_job", crash)
+    with pytest.raises(RuntimeError):
+        worker_main.process_next(sync_redis, "w1")
+
+    assert sync_redis.xlen("pending_runs") == 1
+    assert sync_redis.xpending("pending_runs", "workers")["pending"] == 1
+
+    monkeypatch.setattr(worker_main, "run_job", run_job)
+    worker_main.process_next(sync_redis, "w2")
+
+    assert b"final" in clustered(sync_redis)[-1]
+    assert sync_redis.xlen("pending_runs") == 0
+
+
+# A job that kills its worker every time, e.g. out of memory, must not be re-claimed forever.
+def test_job_over_the_delivery_limit_gives_up(sync_redis: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:
+    job_id = enqueue(sync_redis)
+    sync_redis.xreadgroup("workers", "w1", {"pending_runs": ">"}, count=1)
+    for _ in range(worker_main.MAX_DELIVERIES - 1):
+        sync_redis.xclaim("pending_runs", "workers", "w1", 0, [job_id])
+    monkeypatch.setattr(worker_main, "CLAIM_IDLE_MS", 0)
+    monkeypatch.setattr(worker_main, "run_job", lambda *args: pytest.fail("ran a job over the limit"))
+
+    worker_main.process_next(sync_redis, "w2")
+
+    assert clustered(sync_redis) == [{b"phase": b"internal", b"error": b"failed after 3 attempts"}]
+    assert sync_redis.xlen("pending_runs") == 0
+    assert sync_redis.xpending("pending_runs", "workers")["pending"] == 0
+
+
 # A plain XCLAIM adds a delivery on every beat, which would make a crashed job look like it had
 # already failed 3 times and skip recovery.
 def test_heartbeat_keeps_the_delivery_count_at_one(sync_redis: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:

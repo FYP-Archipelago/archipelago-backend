@@ -27,6 +27,35 @@ def heartbeat(r: redis.Redis, name: str, job_id: bytes, stop: threading.Event) -
             log.exception("heartbeat failed")
 
 
+# Takes one abandoned or new job, if there is one, and runs it to the end.
+def process_next(r: redis.Redis, name: str) -> None:
+    claimed = r.xautoclaim(PENDING_RUNS, GROUP, name, CLAIM_IDLE_MS, "0-0", count=1)[1]
+    if not claimed:
+        read = r.xreadgroup(GROUP, name, {PENDING_RUNS: ">"}, count=1, block=5000)  # ms
+        claimed = read[0][1] if read else []
+    if not claimed:
+        return
+    job_id, fields = claimed[0]
+    run_id = fields[JOB_RUN_ID].decode()
+
+    stop = threading.Event()
+    try:
+        # XAUTOCLAIM counts as a delivery, so a job re-claimed once is at 2
+        deliveries = r.xpending_range(PENDING_RUNS, GROUP, job_id, job_id, 1)[0]["times_delivered"]
+        if deliveries > MAX_DELIVERIES:
+            write_error(r, run_id, "internal", f"failed after {MAX_DELIVERIES} attempts")
+        else:
+            log.info("run %s: starting (delivery %d)", run_id, deliveries)
+            threading.Thread(target=heartbeat, args=(r, name, job_id, stop), daemon=True).start()
+            run_job(r, run_id, fields[JOB_STREAM] == b"true", fields[JOB_CONFIG])
+        # ack last: until then a crash leaves the job pending for another worker to claim
+        r.xack(PENDING_RUNS, GROUP, job_id)
+        r.xdel(PENDING_RUNS, job_id)
+        log.info("run %s: done", run_id)
+    finally:
+        stop.set()
+
+
 def main() -> None:
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     url = os.environ.get("ARCHIPELAGO_REDIS_URL")
@@ -43,34 +72,11 @@ def main() -> None:
     log.info("worker %s started", name)
 
     while True:
-        stop = threading.Event()
         try:
-            claimed = r.xautoclaim(PENDING_RUNS, GROUP, name, CLAIM_IDLE_MS, "0-0", count=1)[1]
-            if not claimed:
-                read = r.xreadgroup(GROUP, name, {PENDING_RUNS: ">"}, count=1, block=5000)  # ms
-                claimed = read[0][1] if read else []
-            if not claimed:
-                continue
-            job_id, fields = claimed[0]
-            run_id = fields[JOB_RUN_ID].decode()
-
-            # XAUTOCLAIM counts as a delivery, so a job re-claimed once is at 2
-            deliveries = r.xpending_range(PENDING_RUNS, GROUP, job_id, job_id, 1)[0]["times_delivered"]
-            if deliveries > MAX_DELIVERIES:
-                write_error(r, run_id, "internal", f"failed after {MAX_DELIVERIES} attempts")
-            else:
-                log.info("run %s: starting (delivery %d)", run_id, deliveries)
-                threading.Thread(target=heartbeat, args=(r, name, job_id, stop), daemon=True).start()
-                run_job(r, run_id, fields[JOB_STREAM] == b"true", fields[JOB_CONFIG])
-            # ack last: until then a crash leaves the job pending for another worker to claim
-            r.xack(PENDING_RUNS, GROUP, job_id)
-            r.xdel(PENDING_RUNS, job_id)
-            log.info("run %s: done", run_id)
+            process_next(r, name)
         except Exception:
             log.exception("worker loop failed; a held job stays unacked for re-claim")
             time.sleep(ERROR_BACKOFF_SECONDS)
-        finally:
-            stop.set()
 
 
 if __name__ == "__main__":

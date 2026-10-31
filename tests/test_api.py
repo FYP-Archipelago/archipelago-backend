@@ -52,6 +52,17 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
     assert Config.model_validate_json(job[b"config"]) == Config(lsh=True)
 
 
+# What a Redis restart does to the API's idle connections.
+async def test_create_run_survives_a_dead_pooled_redis_connection(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
+    assert (await api.get("/health")).status_code == 200
+    assert sync_redis.client_kill_filter(_type="normal", skipme=True) >= 1
+
+    r = await api.post("/runs", json=BODY)
+
+    assert r.status_code == 202
+    assert sync_redis.xlen("pending_runs") == 1
+
+
 async def test_runner_rejection_fails_the_run_and_aborts_the_job(api: httpx.AsyncClient, runner: FakeRunner, sync_redis: redis.Redis) -> None:
     runner.start = httpx.Response(422, json={"error": "unknown preset 'de-rastrigin'"})
 
