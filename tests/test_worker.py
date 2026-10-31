@@ -98,7 +98,7 @@ def test_finished_job_is_not_redone(sync_redis: redis.Redis, log_entries: list[d
             "time limit of 3600 s",
             False,
         ),
-        (entry("event", {"type": "run_end", "termination_reason": "budget"}, "3-0"), None, True),
+        (entry("event", {"type": "run_end", "termination_reason": "completed"}, "3-0"), None, True),
     ],
 )
 def test_first_terminator_wins(terminator: tuple[bytes, dict[bytes, bytes]], failure: str | None, ended: bool) -> None:

@@ -81,17 +81,17 @@ def log_entries(per_island: int = 150, islands: int = 3, dimension: int = 4) -> 
             text = json.dumps(genome)
             row = {
                 "run_id": SYNTHETIC_RUN_ID,
-                "island_id": str(island),
-                "seq": str(len(records[island])),
-                "eval_index": str(k),
-                "generation": str(k // 10),
-                "t_wall": repr(0.5 * k + 0.1 * island),
+                "island_id": island,
+                "seq": len(records[island]),
+                "eval_index": k,
+                "generation": k // 10,
+                "t_wall": 0.5 * k + 0.1 * island,
                 "individual_id": ids[island][k],
-                "parent_ids": ids[island][k - 1] if k else "",
-                "fitness": repr(sum(x * x for x in genome)),
+                "parent_ids": [ids[island][k - 1]] if k else [],
+                "fitness": sum(x * x for x in genome),
                 "genome_encoding": "real_vector",
                 "genome_hash": hashlib.sha1(text.encode()).hexdigest()[:12],
-                "genome_repr": text,
+                "genome_repr": genome,
                 "genome_repr_mode": "full",
             }
             records[island].append({"kind": "row", "data": row})
@@ -132,7 +132,7 @@ def log_entries(per_island: int = 150, islands: int = 3, dimension: int = 4) -> 
     ends = [
         *({"type": "generation_end", "island_id": island, "maximising": False} for island in range(islands)),
         *({"type": "island_end", "island_id": island} for island in range(islands)),
-        {"type": "run_end", "termination_reason": "budget"},
+        {"type": "run_end", "termination_reason": "completed"},
     ]
     turns = [record for turn in zip(*records, strict=True) for record in turn]
     return [*({"kind": "event", "data": e} for e in [start, *island_starts]), *turns, *({"kind": "event", "data": e} for e in ends)]
