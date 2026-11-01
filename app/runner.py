@@ -57,7 +57,7 @@ async def start(client: httpx.AsyncClient, run_id: str, preset: str, overrides: 
         return RunnerStatus(state=response.json()["state"], error=None)
     if response.status_code == 422:
         raise RunnerRejected(_error_text(response))
-    raise RunnerUnavailable(f"runner answered {response.status_code} to the start: {response.text[:200]}")
+    raise RunnerUnavailable(f"runner answered {response.status_code} to the start: {_error_text(response)}")
 
 
 async def status(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:

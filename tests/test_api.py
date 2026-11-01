@@ -91,6 +91,15 @@ async def test_unreachable_runner_gives_502_and_fails_the_run(api: httpx.AsyncCl
     assert run is not None and run.status == "failed" and run.error is not None and run.error.phase == "runner"
 
 
+async def test_a_failed_start_shows_the_runners_error_text(api: httpx.AsyncClient, runner: FakeRunner) -> None:
+    runner.start = httpx.Response(503, json={"error": "runner is shutting down"})
+
+    r = await api.post("/runs", json=BODY)
+
+    assert r.status_code == 502
+    assert r.json() == {"detail": "runner answered 503 to the start: runner is shutting down"}
+
+
 @pytest.mark.parametrize(
     "body",
     [
