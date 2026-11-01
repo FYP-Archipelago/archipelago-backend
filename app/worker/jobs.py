@@ -12,6 +12,7 @@ from app.redis_names import ABORT, COVERS, DATA, ERROR, EVENT, FINAL, KIND, PHAS
 
 UPDATE_INTERVAL_SECONDS = 1
 IDLE_TIMEOUT_SECONDS = 900
+READ_COUNT = 10_000
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ class Chunk:
     events: list[dict[str, Any]] = field(default_factory=list)
     last_id: bytes = b"0-0"
     ended: bool = False
+    full: bool = False
     failure: str | None = None
 
 
@@ -61,13 +63,14 @@ class RunnerFailed(Exception):
 # Raises RunnerFailed when the runner failed or, once logs have started, they stop for too long.
 def chunks(r: redis.Redis, run_id: str, after: bytes, last_entry: float | None) -> Iterator[Chunk]:
     while True:
-        response = r.xread({runner_logs_key(run_id): after}, block=1000)  # ms
+        response = r.xread({runner_logs_key(run_id): after}, count=READ_COUNT, block=1000)  # ms
         if not response:
             if last_entry is not None and time.monotonic() - last_entry > IDLE_TIMEOUT_SECONDS:
                 raise RunnerFailed(f"no logs for {IDLE_TIMEOUT_SECONDS} s")
             continue
         last_entry = time.monotonic()
         chunk = split(response[0][1])
+        chunk.full = len(response[0][1]) == READ_COUNT
         if chunk.failure is not None:
             raise RunnerFailed(chunk.failure)
         yield chunk
@@ -104,10 +107,17 @@ def run_streamed(r: redis.Redis, run_id: str, config: Config, covers: bytes | No
     ended = False
     last_entry: float | None = None
     if covers is not None:
-        # crash recovery: rebuild the state from the logs already clustered, and write nothing
-        chunk = split(r.xrange(runner_logs_key(run_id), "-", covers))
-        cs.cluster(chunk.rows, chunk.events)
-        after, ended, last_entry = covers, chunk.ended, time.monotonic()
+        # crash recovery: rebuild the state from the logs already clustered, in pages of READ_COUNT, writing nothing
+        start: str | bytes = "-"
+        while True:
+            page = r.xrange(runner_logs_key(run_id), start, covers, count=READ_COUNT)
+            chunk = split(page)
+            cs.cluster(chunk.rows, chunk.events)
+            ended = ended or chunk.ended
+            if len(page) < READ_COUNT:
+                break
+            start = b"(" + page[-1][0]
+        after, last_entry = covers, time.monotonic()
         log.info("run %s: replayed up to %s", run_id, covers.decode())
 
     if not ended:
@@ -115,9 +125,9 @@ def run_streamed(r: redis.Redis, run_id: str, config: Config, covers: bytes | No
             tick = time.monotonic()
             update = cs.cluster(chunk.rows, chunk.events)
             r.xadd(clustered_key(run_id), {COVERS: chunk.last_id, UPDATE: update.model_dump_json()})
-            # at most one cluster() per tick: each update re-sends drifting percentiles and weights, so
-            # many tiny updates would bloat clustered and every SSE replay of it
-            if not chunk.ended:
+            # at most one cluster() per tick: tiny updates each re-send drifting percentiles and weights, bloating clustered and every SSE replay
+            # a full read means a backlog, and sleeping would cap catching up at READ_COUNT rows per tick
+            if not (chunk.ended or chunk.full):
                 time.sleep(max(0.0, tick + UPDATE_INTERVAL_SECONDS - time.monotonic()))
 
     r.xadd(clustered_key(run_id), {FINAL: cs.finish().model_dump_json()})
