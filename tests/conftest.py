@@ -109,7 +109,6 @@ def log_entries(per_island: int = 150, islands: int = 3, dimension: int = 4) -> 
 
     start = {
         "type": "run_start",
-        "schema_version": "2.0",
         "run_id": SYNTHETIC_RUN_ID,
         "algorithm": "ga",
         "benchmark": "sphere",
