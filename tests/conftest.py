@@ -32,6 +32,7 @@ class FakeRunner:
     error: str | None = None
     start: httpx.Response | Exception = field(default_factory=lambda: httpx.Response(202, json={"run_id": "", "state": "running"}))
     status: httpx.Response | Exception | Callable[[], httpx.Response] | None = None
+    cancel: httpx.Response | Exception = field(default_factory=lambda: httpx.Response(202, json={"state": "running"}))
     presets: httpx.Response = field(default_factory=lambda: httpx.Response(200, content=b'{"overrides": {}, "presets": []}'))
     on_start: Callable[[], None] | None = None
     calls: list[str] = field(default_factory=list)
@@ -45,7 +46,7 @@ class FakeRunner:
                 self.on_start()
             return _answer(self.start)
         if request.url.path.endswith("/cancel"):
-            return httpx.Response(202)
+            return _answer(self.cancel)
         if callable(self.status):
             return self.status()
         if self.status is not None:

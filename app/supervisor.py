@@ -164,5 +164,8 @@ async def _clean_up_failed(state: _RunState, message: str) -> None:
         await write_abort(state.redis, state.run_id, message)
         state.abort_sent = True
     if not state.runner_done and not state.cancel_sent:
-        await runner.cancel(state.client, state.run_id)
+        try:
+            await runner.cancel(state.client, state.run_id)
+        except RunnerUnavailable as e:
+            logger.warning("cancel of %s failed: %s", state.run_id, e)
         state.cancel_sent = True

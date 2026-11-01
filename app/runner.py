@@ -1,12 +1,9 @@
-import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
 
 RUNNER_TIMEOUT_SECONDS = 10
-
-logger = logging.getLogger(__name__)
 
 RunnerState = Literal["queued", "running", "finished", "failed", "cancelled", "unknown"]
 
@@ -70,11 +67,14 @@ async def status(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:
     return RunnerStatus(state=body["state"], error=body.get("error"))
 
 
-async def cancel(client: httpx.AsyncClient, run_id: str) -> None:
+async def cancel(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:
+    response = await _request(client, "POST", f"/runs/{run_id}/cancel")
+    if response.status_code == 404:
+        return RunnerStatus(state="unknown", error=None)
+    if not response.is_success:
+        raise RunnerUnavailable(f"runner answered {response.status_code} to the cancel: {_error_text(response)}")
     try:
-        response = await _request(client, "POST", f"/runs/{run_id}/cancel")
-    except RunnerUnavailable as e:
-        logger.warning("cancel of %s failed: %s", run_id, e)
-        return
-    if not (response.is_success or response.status_code == 404):
-        logger.warning("cancel of %s answered %s", run_id, response.status_code)
+        body = response.json()
+        return RunnerStatus(state=body["state"], error=body.get("error"))
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise RunnerUnavailable(f"runner gave an unreadable answer to the cancel: {response.text[:200]}") from e
