@@ -77,6 +77,31 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
     return run
 
 
+@router.post("/runs/{run_id}/cancel", responses={202: {"model": RunStatus}})
+async def cancel_run(run_id: str, request: Request, response: Response) -> RunStatus:
+    state: Any = request.app.state
+    run = await queries.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if run.status in ("done", "failed", "cancelled"):
+        return run
+    # in clustering the runner is already done, so only the worker is left
+    if run.status != "clustering":
+        try:
+            cancelled = await runner.cancel(state.runner, run_id)
+        except RunnerUnavailable as e:
+            raise HTTPException(502, str(e)) from e
+        # failed or unknown means the run is over anyway: the supervisor settles those from here
+        if cancelled.state not in ("running", "cancelled", "finished"):
+            return run
+    # a worker still clustering can't be interrupted, but its result is not saved for a cancelled run
+    await queries.set_cancelled(state.pool, run_id)
+    updated = await queries.get_run(state.pool, run_id) or run
+    if updated.status == "cancelled":
+        response.status_code = 202
+    return updated
+
+
 @router.get("/runs/{run_id}/events")
 async def run_events(run_id: str, request: Request) -> StreamingResponse:
     state: Any = request.app.state

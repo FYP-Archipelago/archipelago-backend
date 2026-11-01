@@ -209,6 +209,105 @@ async def test_events_of_a_done_run_with_expired_streams_say_done(api: httpx.Asy
     assert events == [("status", None, {"status": "done"})]
 
 
+@pytest.mark.parametrize("path", ["/runs/nope/cancel", "/runs/run-20261027T000000Z-00000000/cancel"])
+async def test_cancel_of_a_malformed_or_unknown_run_is_404(api: httpx.AsyncClient, runner: FakeRunner, path: str) -> None:
+    r = await api.post(path)
+
+    assert r.status_code == 404
+    assert r.json() == {"detail": "run not found"}
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("status", ["done", "failed", "cancelled"])
+async def test_cancel_of_a_final_run_is_a_no_op_without_the_runner(api: httpx.AsyncClient, runner: FakeRunner, status: str) -> None:
+    await seed_run(status)
+
+    r = await api.post(f"/runs/{RUN_ID}/cancel")
+
+    assert r.status_code == 200
+    assert r.json()["status"] == status
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("status", "answer"),
+    [
+        ("queued", httpx.Response(200, json={"state": "cancelled"})),
+        ("running", httpx.Response(202, json={"state": "running"})),
+        ("running", httpx.Response(200, json={"state": "cancelled"})),
+        ("running", httpx.Response(200, json={"state": "finished"})),
+    ],
+)
+async def test_cancel_accepted_by_the_runner_sets_cancelled(api: httpx.AsyncClient, runner: FakeRunner, status: str, answer: httpx.Response) -> None:
+    await seed_run(status)
+    runner.cancel = answer
+
+    r = await api.post(f"/runs/{RUN_ID}/cancel")
+
+    assert r.status_code == 202
+    assert r.json()["status"] == "cancelled" and r.json()["error"] is None
+    assert runner.calls == [f"POST /runs/{RUN_ID}/cancel"]
+    run = await queries.get_run(app.state.pool, RUN_ID)
+    assert run is not None and run.status == "cancelled" and run.error is None
+
+
+# Only the worker is left in clustering, so a runner that can't be reached doesn't matter.
+async def test_cancel_while_clustering_needs_no_runner(api: httpx.AsyncClient, runner: FakeRunner) -> None:
+    await seed_run("clustering", stream=False)
+    runner.cancel = httpx.ConnectError("refused")
+
+    r = await api.post(f"/runs/{RUN_ID}/cancel")
+
+    assert r.status_code == 202
+    assert r.json()["status"] == "cancelled"
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("answer", [httpx.Response(200, json={"state": "failed"}), httpx.Response(404)])
+async def test_cancel_of_a_run_the_runner_lost_leaves_the_status_to_the_supervisor(
+    api: httpx.AsyncClient, runner: FakeRunner, answer: httpx.Response
+) -> None:
+    await seed_run("running")
+    runner.cancel = answer
+
+    r = await api.post(f"/runs/{RUN_ID}/cancel")
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "running"
+
+
+# The result can be saved between the runner's answer and set_cancelled, and then the run stays done.
+async def test_cancel_that_loses_to_the_result_returns_the_done_run(
+    api: httpx.AsyncClient, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seed_run("running")
+    runner.cancel = httpx.Response(200, json={"state": "finished"})
+
+    async def result_saved_first(pool: object, run_id: str) -> None:
+        await queries.save_result(app.state.pool, run_id, b"result")
+
+    monkeypatch.setattr(queries, "set_cancelled", result_saved_first)
+
+    r = await api.post(f"/runs/{RUN_ID}/cancel")
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "done"
+
+
+@pytest.mark.parametrize("answer", [httpx.ConnectError("refused"), httpx.Response(500, text="boom"), httpx.Response(202, text="not json")])
+async def test_cancel_the_runner_did_not_accept_gives_502_and_keeps_the_status(
+    api: httpx.AsyncClient, runner: FakeRunner, answer: httpx.Response | Exception
+) -> None:
+    await seed_run("running")
+    runner.cancel = answer
+
+    r = await api.post(f"/runs/{RUN_ID}/cancel")
+
+    assert r.status_code == 502
+    run = await queries.get_run(app.state.pool, RUN_ID)
+    assert run is not None and run.status == "running"
+
+
 @pytest.mark.parametrize("entry", [{"phase": "runner", "error": "run cancelled"}, {"final": '{"n": 3}'}, {}])
 async def test_events_of_a_cancelled_run_end_with_the_status_only(api: httpx.AsyncClient, sync_redis: redis.Redis, entry: dict[str, str]) -> None:
     await seed_run("cancelled")

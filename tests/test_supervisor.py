@@ -111,6 +111,29 @@ async def test_streams_expire_only_after_the_runner_stopped(api: httpx.AsyncClie
     assert run.error is not None and (run.error.phase, run.error.message) == ("clustering", "bad genome")
 
 
+# The route already cancelled the runner, so the supervisor aborts the worker and waits for both to stop without cancelling again.
+# A final that still arrives is not saved.
+async def test_cancelled_run_is_cleaned_up_and_its_late_final_is_not_saved(
+    api: httpx.AsyncClient, runner: FakeRunner, sync_redis: redis.Redis
+) -> None:
+    run_id = await create_run(api, stream=True)
+
+    r = await api.post(f"/runs/{run_id}/cancel")
+    assert r.status_code == 202
+    await anyio.sleep(3)
+
+    assert not await streams_expired(run_id)
+    [(_, abort)] = sync_redis.xrange(f"run:{run_id}:runner_logs")
+    assert abort[b"kind"] == b"abort" and json.loads(abort[b"data"]) == {"error": "run cancelled"}
+    runner.state = "cancelled"
+    finish_job(sync_redis, run_id, final='{"graph": {}}')
+    await wait_for(lambda: streams_expired(run_id))
+    run = await queries.get_run(app.state.pool, run_id)
+    assert run is not None and run.status == "cancelled" and run.error is None
+    assert await queries.get_result_body(app.state.pool, run_id) is None
+    assert runner.calls.count(f"POST /runs/{run_id}/cancel") == 1
+
+
 async def test_a_cancelled_run_whose_streams_did_not_expire_is_finished_after_a_restart(running_app: Callable[[], Any], runner: FakeRunner) -> None:
     run_id = "run-20261027T000000Z-c4c4c4c4"
     async with running_app():
