@@ -100,6 +100,10 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                     if UPDATE in fields:
                         yield _sse("update", fields[UPDATE], entry_id)
                     elif FINAL in fields:
+                        current = await queries.get_run(state.pool, run_id)
+                        if current is not None and current.error is not None:
+                            yield _sse("error", current.error.model_dump_json().encode())
+                            return
                         yield _sse("final", fields[FINAL], entry_id)
                         return
                     elif PHASE in fields and ERROR in fields:

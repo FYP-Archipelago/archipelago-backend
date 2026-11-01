@@ -180,6 +180,15 @@ async def test_events_end_with_the_error_of_a_failed_run(api: httpx.AsyncClient,
     assert events[-1] == ("error", None, {"phase": "clustering", "message": "bad genome"})
 
 
+async def test_events_give_the_error_not_a_final_for_a_run_that_already_failed(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
+    await seed_run("failed")
+    sync_redis.xadd(f"run:{RUN_ID}:clustered", {"final": '{"n": 3}'})
+
+    events = parse_sse((await api.get(f"/runs/{RUN_ID}/events")).text)
+
+    assert events == [("status", None, {"status": "failed"}), ("error", None, {"phase": "clustering", "message": "boom"})]
+
+
 async def test_events_of_a_done_run_with_expired_streams_say_done(api: httpx.AsyncClient) -> None:
     await seed_run()
     await queries.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
