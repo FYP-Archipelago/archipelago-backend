@@ -1,1 +1,1 @@
-"""Archipelago clustering API — the connecting layer between the frontend and dEA-clustering."""
+__version__ = "0.2.0"

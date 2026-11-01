@@ -1,9 +1,0 @@
-# The REST layer only. The clustering pipeline's own dependencies come from
-# dEA-clustering/pyproject.toml; this service imports that checkout in place and
-# does not restate them.
-
-fastapi>=0.110
-uvicorn[standard]>=0.29
-python-multipart>=0.0.9   # multipart form parsing for the zip upload endpoint
-pydantic>=2.8
-httpx>=0.27               # test client
