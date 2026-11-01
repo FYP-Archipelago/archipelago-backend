@@ -73,6 +73,14 @@ async def set_failed(pool: AsyncConnectionPool, run_id: str, phase: Phase, messa
         )
 
 
+async def set_cancelled(pool: AsyncConnectionPool, run_id: str) -> None:
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE runs SET status = 'cancelled', updated_at = now() WHERE run_id = %s AND status = ANY(%s)",
+            (run_id, NON_FINAL),
+        )
+
+
 async def save_result(pool: AsyncConnectionPool, run_id: str, body: bytes) -> None:
     async with pool.connection() as conn, conn.transaction():
         cur = await conn.execute(

@@ -4,7 +4,7 @@ from typing import Any, Literal
 from archipelago import Config
 from pydantic import BaseModel, ConfigDict
 
-Status = Literal["queued", "running", "clustering", "done", "failed"]
+Status = Literal["queued", "running", "clustering", "done", "failed", "cancelled"]
 Phase = Literal["runner", "clustering", "internal"]
 
 

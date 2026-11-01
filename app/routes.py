@@ -99,15 +99,21 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                     after = entry_id.decode()
                     if UPDATE in fields:
                         yield _sse("update", fields[UPDATE], entry_id)
-                    elif FINAL in fields:
+                    elif FINAL in fields or (PHASE in fields and ERROR in fields):
                         current = await queries.get_run(state.pool, run_id)
+                        # a cancelled run ends with its status: the error entry is the worker's "run cancelled" and a final is stale
+                        if current is not None and current.status == "cancelled":
+                            if status != "cancelled":
+                                yield _sse("status", json.dumps({"status": "cancelled"}).encode())
+                            return
+                        if FINAL not in fields:
+                            yield _sse("error", json.dumps({"phase": fields[PHASE].decode(), "message": fields[ERROR].decode()}).encode())
+                            return
+                        # a run the backend already failed has no result, so /result would answer 404
                         if current is not None and current.error is not None:
                             yield _sse("error", current.error.model_dump_json().encode())
                             return
                         yield _sse("final", fields[FINAL], entry_id)
-                        return
-                    elif PHASE in fields and ERROR in fields:
-                        yield _sse("error", json.dumps({"phase": fields[PHASE].decode(), "message": fields[ERROR].decode()}).encode())
                         return
 
             current = await queries.get_run(state.pool, run_id)
@@ -118,12 +124,12 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
             if current.status != status:
                 status = current.status
                 yield _sse("status", json.dumps({"status": status}).encode())
-            # only once the stream is idle, so entries already written go out before the run is reported failed or done
+            # only once the stream is idle, so entries already written go out before the run is reported failed, cancelled or done
             if not response:
                 if current.error is not None:
                     yield _sse("error", current.error.model_dump_json().encode())
                     return
-                if status == "done":
+                if status in ("done", "cancelled"):
                     return
                 if time.monotonic() - last_output >= KEEPALIVE_SECONDS:
                     yield b": keep-alive\n\n"
@@ -140,7 +146,7 @@ async def run_result(run_id: str, request: Request) -> Response:
         raise HTTPException(404, "run not found")
     body = await queries.get_result_body(state.pool, run_id)
     if body is None:
-        raise HTTPException(404, "no result: run failed" if run.status == "failed" else f"no result: run is {run.status}")
+        raise HTTPException(404, f"no result: run {run.status}" if run.status in ("failed", "cancelled") else f"no result: run is {run.status}")
     headers = {"Vary": "Accept-Encoding"}
     if "gzip" in request.headers.get("accept-encoding", ""):
         return Response(body, media_type="application/json", headers={**headers, "Content-Encoding": "gzip"})

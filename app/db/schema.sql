@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS runs (
     run_id text PRIMARY KEY,
-    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'clustering', 'done', 'failed')),
+    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'clustering', 'done', 'failed', 'cancelled')),
     stream boolean NOT NULL,
     preset text NOT NULL,
     overrides jsonb NOT NULL DEFAULT '{}',

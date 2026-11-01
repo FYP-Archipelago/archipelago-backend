@@ -84,8 +84,10 @@ async def _supervise(state: _RunState) -> None:
             # a done run's result is saved, even if its streams expired before the API last stopped
             if run.status == "done":
                 state.worker_done = True
-            if run.status == "failed":
-                await _clean_up_failed(state, run.error.message if run.error else "run failed")
+            if run.status in ("failed", "cancelled"):
+                # a cancelled run's runner was already cancelled, by the route or by the runner itself
+                state.cancel_sent = state.cancel_sent or run.status == "cancelled"
+                await _clean_up_stopped(state, run.error.message if run.error else "run cancelled")
 
             # EXPIRE deletes the key, and a later XADD recreates it with no TTL, so wait until
             # neither the runner nor the worker can write to these streams again
@@ -151,15 +153,15 @@ async def _poll_runner(state: _RunState) -> None:
         await queries.set_failed(state.pool, state.run_id, "runner", polled.error or "runner failed")
     elif polled.state == "cancelled":
         state.runner_done = True
-        await queries.set_failed(state.pool, state.run_id, "runner", "run cancelled")
+        await queries.set_cancelled(state.pool, state.run_id)
     elif polled.state == "unknown":
         state.runner_done = True
         await queries.set_failed(state.pool, state.run_id, "runner", "runner has no record of this run")
 
 
-# A failed run still needs both sides to stop before its streams can expire: the worker is told
-# through an abort entry (it answers with an error entry), the runner through its cancel endpoint.
-async def _clean_up_failed(state: _RunState, message: str) -> None:
+# A failed or cancelled run still needs both sides to stop before its streams can expire.
+# The worker is told through an abort entry (it answers with an error entry), the runner through its cancel endpoint.
+async def _clean_up_stopped(state: _RunState, message: str) -> None:
     if not state.worker_done and not state.abort_sent:
         await write_abort(state.redis, state.run_id, message)
         state.abort_sent = True

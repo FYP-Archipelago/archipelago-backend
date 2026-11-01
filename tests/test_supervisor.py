@@ -107,7 +107,23 @@ async def test_streams_expire_only_after_the_runner_stopped(api: httpx.AsyncClie
     runner.state, runner.error = "cancelled", None
     await wait_for(lambda: streams_expired(run_id))
     run = await queries.get_run(app.state.pool, run_id)
-    assert run is not None and run.error is not None and (run.error.phase, run.error.message) == ("clustering", "bad genome")
+    assert run is not None and run.status == "failed"
+    assert run.error is not None and (run.error.phase, run.error.message) == ("clustering", "bad genome")
+
+
+async def test_a_cancelled_run_whose_streams_did_not_expire_is_finished_after_a_restart(running_app: Callable[[], Any], runner: FakeRunner) -> None:
+    run_id = "run-20261027T000000Z-c4c4c4c4"
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await queries.set_cancelled(app.state.pool, run_id)
+
+    runner.state = "cancelled"
+
+    async with running_app():
+        redis_client = app.state.redis
+        await redis_client.xadd(f"run:{run_id}:clustered", {"phase": "runner", "error": "run cancelled"})
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "cancelled")
 
 
 async def test_runner_failure_aborts_the_job_with_its_reason(api: httpx.AsyncClient, runner: FakeRunner, sync_redis: redis.Redis) -> None:

@@ -31,6 +31,8 @@ async def seed_run(status: str = "queued", stream: bool = True) -> None:
     await queries.insert_run(app.state.pool, RUN_ID, CreateRun.model_validate({**BODY, "stream": stream}))
     if status == "failed":
         await queries.set_failed(app.state.pool, RUN_ID, "clustering", "boom")
+    elif status == "cancelled":
+        await queries.set_cancelled(app.state.pool, RUN_ID)
     elif status != "queued":
         await queries.advance_status(app.state.pool, RUN_ID, status)
 
@@ -205,6 +207,26 @@ async def test_events_of_a_done_run_with_expired_streams_say_done(api: httpx.Asy
     events = parse_sse((await api.get(f"/runs/{RUN_ID}/events")).text)
 
     assert events == [("status", None, {"status": "done"})]
+
+
+@pytest.mark.parametrize("entry", [{"phase": "runner", "error": "run cancelled"}, {"final": '{"n": 3}'}, {}])
+async def test_events_of_a_cancelled_run_end_with_the_status_only(api: httpx.AsyncClient, sync_redis: redis.Redis, entry: dict[str, str]) -> None:
+    await seed_run("cancelled")
+    if entry:
+        sync_redis.xadd(f"run:{RUN_ID}:clustered", entry)
+
+    events = parse_sse((await api.get(f"/runs/{RUN_ID}/events")).text)
+
+    assert events == [("status", None, {"status": "cancelled"})]
+
+
+async def test_result_of_a_cancelled_run_is_404(api: httpx.AsyncClient) -> None:
+    await seed_run("cancelled")
+
+    r = await api.get(f"/runs/{RUN_ID}/result")
+
+    assert r.status_code == 404
+    assert r.json() == {"detail": "no result: run cancelled"}
 
 
 async def test_statuses_only_move_forward(api: httpx.AsyncClient) -> None:
