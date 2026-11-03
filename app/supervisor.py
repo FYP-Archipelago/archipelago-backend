@@ -13,7 +13,7 @@ from redis.asyncio import Redis
 from app import runner
 from app.db import queries
 from app.models import Phase
-from app.redis_names import ABORT, DATA, ERROR, FINAL, KIND, PHASE, clustered_key, runner_logs_key
+from app.redis_names import ABORT, DATA, ERROR, FINAL, JOB_RUN_ID, KIND, PENDING_RUNS, PHASE, clustered_key, runner_logs_key
 from app.runner import RunnerUnavailable
 
 POLL_SECONDS = 2
@@ -21,6 +21,7 @@ RUNNER_MIA_SECONDS = 60
 STREAM_TTL_SECONDS = 60
 MAX_ERRORS = 3
 ERROR_RETRY_SECONDS = 5
+PENDING_SCAN_PAGE_SIZE = 100
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,8 @@ async def _poll_runner(state: _RunState) -> None:
 # A failed or cancelled run still needs both sides to stop before its streams can expire.
 # The worker is told through an abort entry (it answers with an error entry), the runner through its cancel endpoint.
 async def _clean_up_stopped(state: _RunState, message: str) -> None:
+    if state.runner_done and not state.worker_done and not await _has_worker_job(state.redis, state.run_id):
+        state.worker_done = True
     if not state.worker_done and not state.abort_sent:
         await write_abort(state.redis, state.run_id, message)
         state.abort_sent = True
@@ -171,3 +174,18 @@ async def _clean_up_stopped(state: _RunState, message: str) -> None:
         except RunnerUnavailable as e:
             logger.warning("cancel of %s failed: %s", state.run_id, e)
         state.cancel_sent = True
+
+
+async def _has_worker_job(redis: Redis, run_id: str) -> bool:
+    run_id_bytes = run_id.encode()
+    start = b"-"
+    while True:
+        entries = await redis.xrange(PENDING_RUNS, min=start, max=b"+", count=PENDING_SCAN_PAGE_SIZE)
+        if not entries:
+            return False
+        for _, fields in entries:
+            if fields.get(JOB_RUN_ID) == run_id_bytes:
+                return True
+        if len(entries) < PENDING_SCAN_PAGE_SIZE:
+            return False
+        start = b"(" + entries[-1][0]

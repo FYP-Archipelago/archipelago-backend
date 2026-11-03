@@ -149,6 +149,88 @@ async def test_a_cancelled_run_whose_streams_did_not_expire_is_finished_after_a_
         assert await status_is(run_id, "cancelled")
 
 
+async def test_orphaned_saved_run_without_a_queued_job_is_cleaned_up(running_app: Callable[[], Any], runner: FakeRunner) -> None:
+    run_id = "run-20261027T000000Z-a1a1a1a1"
+    runner.status = httpx.Response(404)
+
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+
+    async with running_app():
+        await wait_for(lambda: streams_expired(run_id))
+        run = await queries.get_run(app.state.pool, run_id)
+        assert run is not None and run.status == "failed"
+        assert await app.state.redis.xlen(f"run:{run_id}:runner_logs") == 0
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+async def test_stopped_run_with_lost_terminal_entry_is_cleaned_after_restart(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, status: str
+) -> None:
+    run_id = "run-20261027T000000Z-a1a1a1a1"
+    runner.state = "finished"
+
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        if status == "failed":
+            await queries.set_failed(app.state.pool, run_id, "runner", "runner failed")
+        else:
+            await queries.set_cancelled(app.state.pool, run_id)
+        sync_redis.xadd("pending_runs", {"run_id": run_id, "stream": "false", "config": "{}"})
+        sync_redis.xadd(f"run:{run_id}:clustered", {"phase": "clustering", "error": "terminal response"})
+        for job_id, job in sync_redis.xrange("pending_runs"):
+            if job[b"run_id"] == run_id.encode():
+                sync_redis.xdel("pending_runs", job_id)
+        sync_redis.delete(f"run:{run_id}:clustered")
+
+    async with running_app():
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, status)
+        assert await app.state.redis.xlen(f"run:{run_id}:runner_logs") == 0
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_pending_job_prevents_early_cleanup_until_worker_finishes(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, claimed: bool
+) -> None:
+    run_id = "run-20261027T000000Z-b2b2b2b2"
+    runner.state = "finished"
+
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await queries.set_failed(app.state.pool, run_id, "runner", "runner failed")
+        sync_redis.xadd("pending_runs", {"run_id": run_id, "stream": "false", "config": "{}"})
+        if claimed:
+            sync_redis.xreadgroup("workers", "worker-1", {"pending_runs": ">"}, count=1)
+
+    async with running_app():
+        await wait_for(lambda: anyio.to_thread.run_sync(lambda: sync_redis.xlen(f"run:{run_id}:runner_logs") > 0))
+        assert not await streams_expired(run_id)
+        [(_, abort)] = sync_redis.xrange(f"run:{run_id}:runner_logs")
+        assert abort[b"kind"] == b"abort"
+
+        finish_job(sync_redis, run_id, phase="runner", error="runner failed")
+        await wait_for(lambda: streams_expired(run_id))
+
+
+async def test_pending_job_scan_finds_a_match_on_a_later_page(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
+    for index in range(supervisor.PENDING_SCAN_PAGE_SIZE):
+        sync_redis.xadd("pending_runs", {"run_id": f"other-{index}", "stream": "false", "config": "{}"})
+    run_id = "run-on-later-page"
+    sync_redis.xadd("pending_runs", {"run_id": run_id, "stream": "false", "config": "{}"})
+
+    assert await supervisor._has_worker_job(app.state.redis, run_id)
+
+
+async def test_pending_job_scan_propagates_redis_errors(api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def broken_xrange(*args: Any, **kwargs: Any) -> list[Any]:
+        raise redis.RedisError("redis unavailable")
+
+    monkeypatch.setattr(app.state.redis, "xrange", broken_xrange)
+    with pytest.raises(redis.RedisError, match="redis unavailable"):
+        await supervisor._has_worker_job(app.state.redis, "run-with-unknown-job-state")
+
+
 async def test_runner_failure_aborts_the_job_with_its_reason(api: httpx.AsyncClient, runner: FakeRunner, sync_redis: redis.Redis) -> None:
     run_id = await create_run(api)
 
