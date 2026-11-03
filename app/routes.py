@@ -198,9 +198,36 @@ async def health(request: Request) -> JSONResponse:
             return False
         return True
 
-    db_ok, redis_ok = await asyncio.gather(check_db(), check_redis())
+    async def check_runner() -> bool:
+        try:
+            async with asyncio.timeout(2):
+                return await runner.health(state.runner)
+        except (TimeoutError, RunnerUnavailable):
+            return False
+
+    db_ok, redis_ok, runner_ok = await asyncio.gather(check_db(), check_redis(), check_runner())
     ok = db_ok and redis_ok
+    ready = ok and runner_ok
+    if ready:
+        mood = "ᕕ( ᐛ )ᕗ"
+        message = "200 OK. We are go for launch."
+    elif ok:
+        mood = "(-_-) zZ"
+        message = "Runner is touching grass somewhere. Past runs are still here though, so Yayy?"
+    else:
+        mood = "(╯°□°)╯︵ ┻━┻"
+        missing = ", ".join(name for name, available in (("Postgres", db_ok), ("Redis", redis_ok), ("runner", runner_ok)) if not available)
+        message = f"The dependency graph has become a crime scene. They lowkey dead: {missing}."
     return JSONResponse(
-        {"status": "ok" if ok else "unavailable", "version": __version__, "db": db_ok, "redis": redis_ok},
+        {
+            "status": "ok" if ok else "unavailable",
+            "version": __version__,
+            "db": db_ok,
+            "redis": redis_ok,
+            "runner": runner_ok,
+            "ready": ready,
+            "mood": mood,
+            "message": message,
+        },
         status_code=200 if ok else 503,
     )

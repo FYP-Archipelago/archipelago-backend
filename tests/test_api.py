@@ -1,12 +1,15 @@
+import asyncio
 import gzip
 import json
 from typing import Any
 
 import httpx
+import psycopg
 import pytest
 import redis
 from archipelago import Config
 
+from app import runner as runner_client
 from app.db import queries
 from app.main import app
 from app.models import CreateRun
@@ -343,4 +346,66 @@ async def test_health(api: httpx.AsyncClient) -> None:
     r = await api.get("/health")
 
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "version": "0.2.0", "db": True, "redis": True}
+    body = r.json()
+    for field in ("mood", "message"):
+        value = body.pop(field)
+        assert isinstance(value, str) and value
+    assert body == {"status": "ok", "version": "0.2.0", "db": True, "redis": True, "runner": True, "ready": True}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [httpx.Response(503, json={"status": "unavailable"}), httpx.ConnectError("runner offline"), httpx.Response(200, text="not JSON")],
+)
+async def test_unhealthy_runner_does_not_make_the_backend_unavailable(
+    api: httpx.AsyncClient, runner: FakeRunner, response: httpx.Response | Exception
+) -> None:
+    runner.health = response
+
+    r = await api.get("/health")
+
+    assert r.status_code == 200
+    body = r.json()
+    for field in ("mood", "message"):
+        value = body.pop(field)
+        assert isinstance(value, str) and value
+    assert body == {"status": "ok", "version": "0.2.0", "db": True, "redis": True, "runner": False, "ready": False}
+
+
+@pytest.mark.parametrize("dependency", ["db", "redis"])
+async def test_health_still_reports_unavailable_for_backend_dependency_failures(
+    api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, dependency: str
+) -> None:
+    def broken_connection() -> None:
+        raise psycopg.OperationalError("postgres offline")
+
+    async def broken_ping() -> None:
+        raise redis.RedisError("redis offline")
+
+    if dependency == "db":
+        monkeypatch.setattr(app.state.pool, "connection", broken_connection)
+    else:
+        monkeypatch.setattr(app.state.redis, "ping", broken_ping)
+
+    r = await api.get("/health")
+
+    assert r.status_code == 503
+    body = r.json()
+    assert body["status"] == "unavailable" and body["ready"] is False
+    assert body["db"] is (dependency != "db") and body["redis"] is (dependency != "redis")
+    assert body["runner"] is True
+    assert ("Postgres" if dependency == "db" else "Redis") in body["message"]
+    assert isinstance(body["mood"], str) and body["mood"]
+
+
+async def test_health_does_not_wait_indefinitely_for_the_runner(api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def stalled_health(client: httpx.AsyncClient) -> bool:
+        await asyncio.Event().wait()
+        return True
+
+    monkeypatch.setattr(runner_client, "health", stalled_health)
+
+    r = await asyncio.wait_for(api.get("/health"), timeout=3)
+
+    assert r.status_code == 200
+    assert r.json()["runner"] is False and r.json()["ready"] is False

@@ -36,9 +36,12 @@ class FakeRunner:
     presets: httpx.Response = field(default_factory=lambda: httpx.Response(200, content=b'{"overrides": {}, "presets": []}'))
     on_start: Callable[[], None] | None = None
     calls: list[str] = field(default_factory=list)
+    health: httpx.Response | Exception = field(default_factory=lambda: httpx.Response(200, json={"status": "ok"}))
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/health":
+            return _answer(self.health)
         if request.url.path == "/presets":
             return self.presets
         if request.method == "POST" and request.url.path == "/runs":
