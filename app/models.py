@@ -32,3 +32,8 @@ class RunStatus(BaseModel):
     error: RunError | None
     created_at: datetime
     updated_at: datetime
+
+
+class RunPage(BaseModel):
+    runs: list[RunStatus]
+    next_cursor: str | None

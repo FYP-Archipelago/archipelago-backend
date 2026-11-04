@@ -17,3 +17,6 @@ CREATE TABLE IF NOT EXISTS results (
     run_id text PRIMARY KEY REFERENCES runs (run_id) ON DELETE CASCADE,
     body bytea NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS runs_history_order_idx
+    ON runs (created_at DESC, run_id DESC);

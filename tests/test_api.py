@@ -57,6 +57,49 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
     assert Config.model_validate_json(job[b"config"]) == Config(lsh=True)
 
 
+async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:
+    ids = ["run-20261027T000000Z-00000001", "run-20261027T000000Z-00000002", "run-20261027T000000Z-00000003"]
+    for run_id in ids:
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+    async with app.state.pool.connection() as conn:
+        await conn.execute("UPDATE runs SET created_at = '2026-10-27T00:00:00Z'")
+
+    first = await api.get("/runs?limit=1")
+    assert first.status_code == 200
+    assert [run["run_id"] for run in first.json()["runs"]] == [ids[2]]
+    cursor = first.json()["next_cursor"]
+    assert (await api.get("/runs", params={"cursor": cursor + "!!!!"})).status_code == 422
+    await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000004", CreateRun.model_validate(BODY))
+
+    second = await api.get("/runs", params={"limit": 1, "cursor": cursor})
+    assert [run["run_id"] for run in second.json()["runs"]] == [ids[1]]
+    third = await api.get("/runs", params={"limit": 1, "cursor": second.json()["next_cursor"]})
+    assert [run["run_id"] for run in third.json()["runs"]] == [ids[0]]
+    assert third.json()["next_cursor"] is None
+
+
+async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClient, runner: FakeRunner) -> None:
+    await seed_run("failed")
+    await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000001", CreateRun.model_validate({**BODY, "preset": "other"}))
+    await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000002", CreateRun.model_validate(BODY))
+    await queries.advance_status(app.state.pool, "run-20261027T000000Z-00000002", "running")
+    response = await api.get("/runs", params={"status": "failed", "preset": "de-rastrigin", "limit": 1})
+    assert response.status_code == 200
+    [run] = response.json()["runs"]
+    assert run["run_id"] == RUN_ID and run["status"] == "failed"
+    assert run["preset"] == BODY["preset"] and run["overrides"] == BODY["overrides"]
+    assert run["stream"] is True and run["clustering"] == Config(lsh=True).model_dump(mode="json")
+    assert run["error"] == {"phase": "clustering", "message": "boom"}
+    assert runner.calls == []
+    empty = await api.get("/runs", params={"preset": "removed-preset"})
+    assert empty.json() == {"runs": [], "next_cursor": None}
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+async def test_run_history_rejects_invalid_page_sizes(api: httpx.AsyncClient, limit: int) -> None:
+    assert (await api.get("/runs", params={"limit": limit})).status_code == 422
+
+
 # What a Redis restart does to the API's idle connections.
 async def test_create_run_survives_a_dead_pooled_redis_connection(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
     assert (await api.get("/health")).status_code == 200

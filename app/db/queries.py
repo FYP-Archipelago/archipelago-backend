@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,29 @@ async def get_run(pool: AsyncConnectionPool, run_id: str) -> RunStatus | None:
         cur = await conn.execute("SELECT * FROM runs WHERE run_id = %s", (run_id,))
         row = await cur.fetchone()
     return _to_run_status(row) if row else None
+
+
+async def list_runs(
+    pool: AsyncConnectionPool, limit: int, status: Status | None, preset: str | None, before: tuple[datetime, str] | None
+) -> list[RunStatus]:
+    conditions = []
+    values: list[Any] = []
+    if status is not None:
+        conditions.append("status = %s")
+        values.append(status)
+    if preset is not None:
+        conditions.append("preset = %s")
+        values.append(preset)
+    if before is not None:
+        conditions.append("(created_at, run_id) < (%s, %s)")
+        values.extend(before)
+    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"SELECT * FROM runs{where} ORDER BY created_at DESC, run_id DESC LIMIT %s",
+            (*values, limit),
+        )
+        return [_to_run_status(row) for row in await cur.fetchall()]
 
 
 async def advance_status(pool: AsyncConnectionPool, run_id: str, to: Status) -> None:

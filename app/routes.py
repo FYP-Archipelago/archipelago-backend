@@ -1,14 +1,17 @@
 import asyncio
+import base64
+import binascii
 import gzip
 import json
 import re
 import time
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 
 import psycopg
 from archipelago import Result
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -16,7 +19,7 @@ from redis.exceptions import RedisError
 from app import __version__, runner
 from app.db import queries
 from app.ids import is_run_id, mint_run_id
-from app.models import CreateRun, RunStatus
+from app.models import CreateRun, RunPage, RunStatus, Status
 from app.redis_names import ERROR, FINAL, JOB_CONFIG, JOB_RUN_ID, JOB_STREAM, PENDING_RUNS, PHASE, UPDATE, clustered_key
 from app.runner import RunnerRejected, RunnerUnavailable
 from app.supervisor import start_supervisor, write_abort
@@ -34,6 +37,26 @@ def _sse(event: str, data: bytes, event_id: bytes | None = None) -> bytes:
     if event_id is not None:
         head += b"id: " + event_id + b"\n"
     return head + b"data: " + data + b"\n\n"
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != {"created_at", "run_id"}:
+            raise ValueError
+        created_at = datetime.fromisoformat(value["created_at"])
+        if created_at.tzinfo is None or created_at.utcoffset() != UTC.utcoffset(created_at) or not is_run_id(value["run_id"]):
+            raise ValueError
+        return created_at, value["run_id"]
+    except (ValueError, TypeError, KeyError, binascii.Error, json.JSONDecodeError) as e:
+        raise HTTPException(422, "invalid cursor") from e
+
+
+# Uses Timestamp and Tie-breaker (run_id) for cursor
+def _encode_cursor(run: RunStatus) -> str:
+    value = json.dumps({"created_at": run.created_at.astimezone(UTC).isoformat(), "run_id": run.run_id}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
 
 
 @router.get("/presets")
@@ -75,6 +98,21 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
         run = run.model_copy(update={"status": "running"})
     start_supervisor(run.run_id, state.pool, redis, state.runner)
     return run
+
+
+@router.get("/runs", response_model=RunPage)
+async def list_runs(
+    request: Request,
+    limit: int = Query(30, ge=1, le=100),
+    status: Status | None = None,
+    preset: str | None = None,
+    cursor: str | None = None,
+) -> RunPage:
+    before = _decode_cursor(cursor) if cursor is not None else None
+    rows = await queries.list_runs(request.app.state.pool, limit + 1, status, preset, before)
+    more = len(rows) > limit
+    runs = rows[:limit]
+    return RunPage(runs=runs, next_cursor=_encode_cursor(runs[-1]) if more else None)
 
 
 @router.post("/runs/{run_id}/cancel", responses={202: {"model": RunStatus}})
