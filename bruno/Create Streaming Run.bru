@@ -1,0 +1,38 @@
+meta {
+  name: Create Streaming Run
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/runs
+  body: json
+  auth: none
+}
+
+headers {
+  Accept: application/json
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "preset": "ga_tsp",
+    "overrides": {
+      "num_islands": 4,
+      "evaluation_budget": 200000,
+      "target_generations": 60,
+      "migration.enabled": false,
+      "seed": 7
+    },
+    "stream": true,
+    "clustering": {"lsh": true, "birch": true, "denstream": true, "seed": 7}
+  }
+}
+
+script:post-response {
+  if (res.getStatus() === 202) {
+    bru.setVar("run_id", res.getBody().run_id);
+    console.log("run_id:", res.getBody().run_id);
+  }
+}
