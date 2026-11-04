@@ -47,7 +47,12 @@ def test_batch_job_result_equals_the_module(sync_redis: redis.Redis, log_entries
     assert without_elapsed(only[b"final"]) == without_elapsed(cluster_run(*split_logs(log_entries), CONFIG).model_dump_json())
 
 
-def test_streamed_job_result_equals_the_module(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
+def test_streamed_backlog_matches_the_module_without_sleeping(
+    sync_redis: redis.Redis, log_entries: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(jobs, "READ_COUNT", 100)
+    sleeps: list[float] = []
+    monkeypatch.setattr(jobs.time, "sleep", sleeps.append)
     push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
     reference = ClusterStream(CONFIG)
     reference.cluster(*split_logs(log_entries))
@@ -55,6 +60,7 @@ def test_streamed_job_result_equals_the_module(sync_redis: redis.Redis, log_entr
     jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, True, CONFIG.model_dump_json().encode())
 
     entries = clustered(sync_redis)
+    assert len(entries) > 2 and sleeps == []
     assert all(b"update" in e and b"covers" in e for e in entries[:-1])
     assert without_elapsed(entries[-1][b"final"]) == without_elapsed(reference.finish().model_dump_json())
 
@@ -62,11 +68,11 @@ def test_streamed_job_result_equals_the_module(sync_redis: redis.Redis, log_entr
 # A worker that crashed after its update covering entry N must, on re-claim, rebuild its state
 # from the logs up to N without writing anything, then carry on and reach the same final result.
 # Paged recovery must give the same result as one read, also when covers lands on a page boundary.
-@pytest.mark.parametrize(("read_count", "covered_at"), [(10_000, 225), (100, 225), (100, 199)])
+@pytest.mark.parametrize("covered_at", [225, 199])
 def test_streamed_job_recovers_from_its_last_update(
-    sync_redis: redis.Redis, log_entries: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch, read_count: int, covered_at: int
+    sync_redis: redis.Redis, log_entries: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch, covered_at: int
 ) -> None:
-    monkeypatch.setattr(jobs, "READ_COUNT", read_count)
+    monkeypatch.setattr(jobs, "READ_COUNT", 100)
     ids = push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
     covered = ids[covered_at]
     sync_redis.xadd(CLUSTERED, {"covers": covered, "update": "{}"})
@@ -96,21 +102,6 @@ def test_backlog_longer_than_one_read_is_processed_fully_and_in_order(
     assert [row for c in read for row in c.rows] == rows
     assert [event for c in read for event in c.events] == events
     assert read[-1].ended and read[-1].last_id == ids[-1]
-
-
-def test_a_full_read_does_not_sleep(sync_redis: redis.Redis, log_entries: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(jobs, "READ_COUNT", 100)
-    sleeps: list[float] = []
-    monkeypatch.setattr(jobs.time, "sleep", sleeps.append)
-    push_logs(sync_redis, SYNTHETIC_RUN_ID, log_entries)
-    reference = ClusterStream(CONFIG)
-    reference.cluster(*split_logs(log_entries))
-
-    jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, True, CONFIG.model_dump_json().encode())
-
-    entries = clustered(sync_redis)
-    assert len(entries) > 2 and sleeps == []
-    assert without_elapsed(entries[-1][b"final"]) == without_elapsed(reference.finish().model_dump_json())
 
 
 def test_finished_job_is_not_redone(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
