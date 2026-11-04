@@ -81,7 +81,7 @@ async def set_cancelled(pool: AsyncConnectionPool, run_id: str) -> None:
         )
 
 
-async def save_result(pool: AsyncConnectionPool, run_id: str, body: bytes) -> None:
+async def save_result(pool: AsyncConnectionPool, run_id: str, body: bytes, explanation_body: bytes | None = None) -> None:
     async with pool.connection() as conn, conn.transaction():
         cur = await conn.execute(
             "UPDATE runs SET status = 'done', updated_at = now() WHERE run_id = %s AND status = ANY(%s)",
@@ -90,6 +90,8 @@ async def save_result(pool: AsyncConnectionPool, run_id: str, body: bytes) -> No
         if cur.rowcount == 0:
             return
         await conn.execute("INSERT INTO results (run_id, body) VALUES (%s, %s)", (run_id, body))
+        if explanation_body is not None:
+            await conn.execute("INSERT INTO explanations (run_id, body) VALUES (%s, %s)", (run_id, explanation_body))
 
 
 async def mark_streams_expired(pool: AsyncConnectionPool, run_id: str) -> None:
@@ -106,5 +108,12 @@ async def list_unexpired(pool: AsyncConnectionPool) -> list[str]:
 async def get_result_body(pool: AsyncConnectionPool, run_id: str) -> bytes | None:
     async with pool.connection() as conn:
         cur = await conn.execute("SELECT body FROM results WHERE run_id = %s", (run_id,))
+        row = await cur.fetchone()
+    return bytes(row["body"]) if row else None
+
+
+async def get_explanation_body(pool: AsyncConnectionPool, run_id: str) -> bytes | None:
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT body FROM explanations WHERE run_id = %s", (run_id,))
         row = await cur.fetchone()
     return bytes(row["body"]) if row else None

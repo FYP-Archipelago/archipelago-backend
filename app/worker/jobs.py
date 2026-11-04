@@ -8,7 +8,8 @@ from typing import Any
 import redis
 from archipelago import ClusteringError, ClusterStream, Config, cluster_run
 
-from app.redis_names import ABORT, COVERS, DATA, ERROR, EVENT, FINAL, KIND, PHASE, ROW, UPDATE, clustered_key, runner_logs_key
+from app.redis_names import ABORT, COVERS, DATA, ERROR, EVENT, FINAL, KIND, PHASE, ROW, SHAPLEY, UPDATE, clustered_key, runner_logs_key
+from app.shapley import ShapleyAccumulator
 
 UPDATE_INTERVAL_SECONDS = 1
 IDLE_TIMEOUT_SECONDS = 900
@@ -103,6 +104,7 @@ def run_job(r: redis.Redis, run_id: str, stream: bool, config_json: bytes) -> No
 
 def run_streamed(r: redis.Redis, run_id: str, config: Config, covers: bytes | None) -> None:
     cs = ClusterStream(config)
+    analysis = ShapleyAccumulator(run_id)
     after = b"0-0"
     ended = False
     last_entry: float | None = None
@@ -113,6 +115,7 @@ def run_streamed(r: redis.Redis, run_id: str, config: Config, covers: bytes | No
             page = r.xrange(runner_logs_key(run_id), start, covers, count=READ_COUNT)
             chunk = split(page)
             cs.cluster(chunk.rows, chunk.events)
+            analysis.add(chunk.rows)
             ended = ended or chunk.ended
             if len(page) < READ_COUNT:
                 break
@@ -124,19 +127,24 @@ def run_streamed(r: redis.Redis, run_id: str, config: Config, covers: bytes | No
         for chunk in chunks(r, run_id, after, last_entry):
             tick = time.monotonic()
             update = cs.cluster(chunk.rows, chunk.events)
+            analysis.add(chunk.rows)
             r.xadd(clustered_key(run_id), {COVERS: chunk.last_id, UPDATE: update.model_dump_json()})
             # at most one cluster() per tick: tiny updates each re-send drifting percentiles and weights, bloating clustered and every SSE replay
             # a full read means a backlog, and sleeping would cap catching up at READ_COUNT rows per tick
             if not (chunk.ended or chunk.full):
                 time.sleep(max(0.0, tick + UPDATE_INTERVAL_SECONDS - time.monotonic()))
 
-    r.xadd(clustered_key(run_id), {FINAL: cs.finish().model_dump_json()})
+    result = cs.finish()
+    r.xadd(clustered_key(run_id), {FINAL: result.model_dump_json(), SHAPLEY: json.dumps(analysis.finish(result.run), allow_nan=False)})
 
 
 def run_batch(r: redis.Redis, run_id: str, config: Config) -> None:
     rows: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
+    analysis = ShapleyAccumulator(run_id)
     for chunk in chunks(r, run_id, b"0-0", None):
         rows += chunk.rows
         events += chunk.events
-    r.xadd(clustered_key(run_id), {FINAL: cluster_run(rows, events, config).model_dump_json()})
+        analysis.add(chunk.rows)
+    result = cluster_run(rows, events, config)
+    r.xadd(clustered_key(run_id), {FINAL: result.model_dump_json(), SHAPLEY: json.dumps(analysis.finish(result.run), allow_nan=False)})
