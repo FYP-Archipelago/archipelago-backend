@@ -115,6 +115,14 @@ async def list_runs(
     return RunPage(runs=runs, next_cursor=_encode_cursor(runs[-1]) if more else None)
 
 
+@router.get("/runs/{run_id}", response_model=RunStatus)
+async def get_run(run_id: str, request: Request) -> RunStatus:
+    run = await queries.get_run(request.app.state.pool, run_id) if is_run_id(run_id) else None
+    if run is None:
+        raise HTTPException(404, "run not found")
+    return run
+
+
 @router.post("/runs/{run_id}/cancel", responses={202: {"model": RunStatus}})
 async def cancel_run(run_id: str, request: Request, response: Response) -> RunStatus:
     state: Any = request.app.state

@@ -100,6 +100,16 @@ async def test_run_history_rejects_invalid_page_sizes(api: httpx.AsyncClient, li
     assert (await api.get("/runs", params={"limit": limit})).status_code == 422
 
 
+async def test_run_lookup_returns_the_same_metadata_as_history(api: httpx.AsyncClient, runner: FakeRunner) -> None:
+    await seed_run("failed")
+
+    response = await api.get(f"/runs/{RUN_ID}")
+
+    assert response.status_code == 200
+    assert response.json() == (await api.get("/runs")).json()["runs"][0]
+    assert runner.calls == []
+
+
 # What a Redis restart does to the API's idle connections.
 async def test_create_run_survives_a_dead_pooled_redis_connection(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
     assert (await api.get("/health")).status_code == 200
@@ -183,7 +193,10 @@ async def test_presets_give_502_when_the_runner_fails(api: httpx.AsyncClient, ru
     assert (await api.get("/presets")).status_code == 502
 
 
-@pytest.mark.parametrize("path", ["/runs/not-a-run/result", f"/runs/{RUN_ID}/result", "/runs/not-a-run/events", f"/runs/{RUN_ID}/events"])
+@pytest.mark.parametrize(
+    "path",
+    ["/runs/not-a-run", f"/runs/{RUN_ID}", "/runs/not-a-run/result", f"/runs/{RUN_ID}/result", "/runs/not-a-run/events", f"/runs/{RUN_ID}/events"],
+)
 async def test_malformed_and_unknown_runs_are_404(api: httpx.AsyncClient, path: str) -> None:
     r = await api.get(path)
 
