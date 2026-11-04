@@ -13,7 +13,7 @@ from redis.asyncio import Redis
 from app import runner
 from app.db import queries
 from app.models import Phase
-from app.redis_names import ABORT, DATA, ERROR, FINAL, KIND, PHASE, clustered_key, runner_logs_key
+from app.redis_names import ABORT, DATA, ERROR, FINAL, KIND, PHASE, SHAPLEY, clustered_key, runner_logs_key
 from app.runner import RunnerUnavailable
 
 POLL_SECONDS = 2
@@ -118,7 +118,11 @@ async def _read_clustered(state: _RunState) -> None:
         for entry_id, fields in entries:
             if FINAL in fields:
                 body = await asyncio.to_thread(gzip.compress, fields[FINAL])
-                await queries.save_result(state.pool, state.run_id, body)
+                if SHAPLEY in fields:
+                    explanation_body = await asyncio.to_thread(gzip.compress, fields[SHAPLEY])
+                    await queries.save_result(state.pool, state.run_id, body, explanation_body=explanation_body)
+                else:
+                    await queries.save_result(state.pool, state.run_id, body)
                 state.worker_done = True
             elif PHASE in fields and ERROR in fields:
                 await queries.set_failed(state.pool, state.run_id, cast(Phase, fields[PHASE].decode()), fields[ERROR].decode())

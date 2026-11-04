@@ -16,7 +16,7 @@ from redis.exceptions import RedisError
 from app import __version__, runner
 from app.db import queries
 from app.ids import is_run_id, mint_run_id
-from app.models import CreateRun, RunStatus
+from app.models import CreateRun, ExplanationResponse, RunStatus
 from app.redis_names import ERROR, FINAL, JOB_CONFIG, JOB_RUN_ID, JOB_STREAM, PENDING_RUNS, PHASE, UPDATE, clustered_key
 from app.runner import RunnerRejected, RunnerUnavailable
 from app.supervisor import start_supervisor, write_abort
@@ -204,3 +204,53 @@ async def health(request: Request) -> JSONResponse:
         {"status": "ok" if ok else "unavailable", "version": __version__, "db": db_ok, "redis": redis_ok},
         status_code=200 if ok else 503,
     )
+
+
+def _accepts_gzip(header: str) -> bool:
+    wildcard = False
+    for item in header.lower().split(","):
+        parts = [part.strip() for part in item.split(";")]
+        quality = 1.0
+        for part in parts[1:]:
+            if part.startswith("q="):
+                try:
+                    quality = float(part[2:])
+                except ValueError:
+                    quality = 0.0
+        allowed = 0.0 < quality <= 1.0
+        if parts[0] == "gzip":
+            return allowed
+        if parts[0] == "*":
+            wildcard = allowed
+    return wildcard
+
+
+@router.get("/runs/{run_id}/explanation", responses={200: {"model": ExplanationResponse}, 202: {"model": ExplanationResponse}})
+async def run_explanation(run_id: str, request: Request) -> Response:
+    state: Any = request.app.state
+    run = await queries.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    if run is None:
+        raise HTTPException(404, "run not found")
+    headers = {"Cache-Control": "no-store", "Vary": "Accept-Encoding"}
+    if run.status in ("queued", "running", "clustering"):
+        pending = ExplanationResponse(run_id=run_id, status="pending", detail=f"Shapley analysis is pending: run {run.status}.")
+        return JSONResponse(pending.model_dump(exclude_none=True), status_code=202, headers=headers)
+    if run.status in ("failed", "cancelled"):
+        unavailable = ExplanationResponse(run_id=run_id, status="unavailable", detail=f"Shapley analysis is unavailable: run {run.status}.")
+        return JSONResponse(unavailable.model_dump(exclude_none=True), headers=headers)
+    body = await queries.get_explanation_body(state.pool, run_id)
+    if body is None:
+        unavailable = ExplanationResponse(run_id=run_id, status="unavailable", detail="No individual-lineage analysis was persisted for this run.")
+        return JSONResponse(unavailable.model_dump(exclude_none=True), headers=headers)
+    try:
+        decoded = await asyncio.to_thread(gzip.decompress, body)
+        envelope = ExplanationResponse.model_validate_json(decoded)
+        if envelope.run_id != run_id or envelope.status == "pending":
+            raise ValueError("invalid stored explanation identity or status")
+        if envelope.status == "ready" and (not envelope.explanation or envelope.explanation.get("run_id") != run_id):
+            raise ValueError("invalid stored attribution identity")
+    except (OSError, ValueError, EOFError) as error:
+        raise HTTPException(503, "Stored Shapley analysis is unavailable; retry or contact the backend maintainer.") from error
+    if _accepts_gzip(request.headers.get("accept-encoding", "")):
+        return Response(body, media_type="application/json", headers={**headers, "Content-Encoding": "gzip"})
+    return Response(decoded, media_type="application/json", headers=headers)

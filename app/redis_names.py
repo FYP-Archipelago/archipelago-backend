@@ -17,6 +17,7 @@ ABORT = b"abort"
 COVERS = b"covers"
 UPDATE = b"update"
 FINAL = b"final"
+SHAPLEY = b"shapley"
 PHASE = b"phase"
 ERROR = b"error"
 

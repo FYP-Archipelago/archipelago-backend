@@ -32,3 +32,11 @@ class RunStatus(BaseModel):
     error: RunError | None
     created_at: datetime
     updated_at: datetime
+
+
+class ExplanationResponse(BaseModel):
+    schema_version: Literal[1] = 1
+    run_id: str
+    status: Literal["ready", "pending", "unavailable"]
+    detail: str | None = None
+    explanation: dict[str, Any] | None = None
