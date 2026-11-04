@@ -11,7 +11,7 @@ from typing import Any
 
 import psycopg
 from archipelago import Result
-from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -26,6 +26,7 @@ from app.supervisor import start_supervisor, write_abort
 
 SSE_BLOCK_MS = 2000
 KEEPALIVE_SECONDS = 15
+RUNS_PAGE_SIZE = 20
 
 STREAM_ID = re.compile(r"^\d+-\d+$")
 
@@ -103,15 +104,14 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
 @router.get("/runs", response_model=RunPage)
 async def list_runs(
     request: Request,
-    limit: int = Query(30, ge=1, le=100),
     status: Status | None = None,
     preset: str | None = None,
     cursor: str | None = None,
 ) -> RunPage:
     before = _decode_cursor(cursor) if cursor is not None else None
-    rows = await queries.list_runs(request.app.state.pool, limit + 1, status, preset, before)
-    more = len(rows) > limit
-    runs = rows[:limit]
+    rows = await queries.list_runs(request.app.state.pool, RUNS_PAGE_SIZE + 1, status, preset, before)
+    more = len(rows) > RUNS_PAGE_SIZE
+    runs = rows[:RUNS_PAGE_SIZE]
     return RunPage(runs=runs, next_cursor=_encode_cursor(runs[-1]) if more else None)
 
 

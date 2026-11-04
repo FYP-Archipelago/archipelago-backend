@@ -60,23 +60,25 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
 
 
 async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:
-    ids = ["run-20261027T000000Z-00000001", "run-20261027T000000Z-00000002", "run-20261027T000000Z-00000003"]
+    ids = [f"run-20261027T000000Z-{value:08x}" for value in range(1, 42)]
     for run_id in ids:
         await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
     async with app.state.pool.connection() as conn:
         await conn.execute("UPDATE runs SET created_at = '2026-10-27T00:00:00Z'")
+    expected = ids[::-1]
 
-    first = await api.get("/runs?limit=1")
+    first = await api.get("/runs")
     assert first.status_code == 200
-    assert [run["run_id"] for run in first.json()["runs"]] == [ids[2]]
+    assert [run["run_id"] for run in first.json()["runs"]] == expected[:20]
+    assert (await api.get("/runs", params={"limit": 1})).json() == first.json()
     cursor = first.json()["next_cursor"]
     assert (await api.get("/runs", params={"cursor": cursor + "!!!!"})).status_code == 422
-    await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000004", CreateRun.model_validate(BODY))
+    await queries.insert_run(app.state.pool, "run-20261027T000000Z-0000002a", CreateRun.model_validate(BODY))
 
-    second = await api.get("/runs", params={"limit": 1, "cursor": cursor})
-    assert [run["run_id"] for run in second.json()["runs"]] == [ids[1]]
-    third = await api.get("/runs", params={"limit": 1, "cursor": second.json()["next_cursor"]})
-    assert [run["run_id"] for run in third.json()["runs"]] == [ids[0]]
+    second = await api.get("/runs", params={"cursor": cursor})
+    assert [run["run_id"] for run in second.json()["runs"]] == expected[20:40]
+    third = await api.get("/runs", params={"cursor": second.json()["next_cursor"]})
+    assert [run["run_id"] for run in third.json()["runs"]] == expected[40:]
     assert third.json()["next_cursor"] is None
 
 
@@ -85,7 +87,7 @@ async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClien
     await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000001", CreateRun.model_validate({**BODY, "preset": "other"}))
     await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000002", CreateRun.model_validate(BODY))
     await queries.advance_status(app.state.pool, "run-20261027T000000Z-00000002", "running")
-    response = await api.get("/runs", params={"status": "failed", "preset": "de-rastrigin", "limit": 1})
+    response = await api.get("/runs", params={"status": "failed", "preset": "de-rastrigin"})
     assert response.status_code == 200
     [run] = response.json()["runs"]
     assert run["run_id"] == RUN_ID and run["status"] == "failed"
@@ -95,11 +97,6 @@ async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClien
     assert runner.calls == []
     empty = await api.get("/runs", params={"preset": "removed-preset"})
     assert empty.json() == {"runs": [], "next_cursor": None}
-
-
-@pytest.mark.parametrize("limit", [0, 101])
-async def test_run_history_rejects_invalid_page_sizes(api: httpx.AsyncClient, limit: int) -> None:
-    assert (await api.get("/runs", params={"limit": limit})).status_code == 422
 
 
 async def test_run_lookup_returns_the_same_metadata_as_history(api: httpx.AsyncClient, runner: FakeRunner) -> None:
