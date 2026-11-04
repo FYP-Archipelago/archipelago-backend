@@ -76,8 +76,10 @@ async def _supervise(state: _RunState) -> None:
     while True:
         try:
             await _read_clustered(state)
+            polled_runner = False
             if not state.runner_done and time.monotonic() - state.last_poll >= POLL_SECONDS:
                 await _poll_runner(state)
+                polled_runner = True
 
             run = await queries.get_run(state.pool, state.run_id)
             if run is None:
@@ -85,17 +87,18 @@ async def _supervise(state: _RunState) -> None:
             # a done run's result is saved, even if its streams expired before the API last stopped
             if run.status == "done":
                 state.worker_done = True
-            if run.status in ("failed", "cancelled"):
-                # a cancelled run's runner was already cancelled, by the route or by the runner itself
+            if run.status in ("failed", "cancelling", "cancelled"):
+                if run.status == "cancelling" and polled_runner and not state.runner_done:
+                    state.cancel_sent = False
                 state.cancel_sent = state.cancel_sent or run.status == "cancelled"
-                await _clean_up_stopped(state, run.error.message if run.error else "run cancelled")
+                await _request_run_shutdown(state, run.error.message if run.error else "run cancelled")
 
             # EXPIRE deletes the key, and a later XADD recreates it with no TTL, so wait until
             # neither the runner nor the worker can write to these streams again
-            if state.runner_done and state.worker_done:
+            if state.runner_done and state.worker_done and not await _has_worker_job(state.redis, state.run_id):
                 await state.redis.expire(runner_logs_key(state.run_id), STREAM_TTL_SECONDS)
                 await state.redis.expire(clustered_key(state.run_id), STREAM_TTL_SECONDS)
-                await queries.mark_streams_expired(state.pool, state.run_id)
+                await queries.finish_cleanup(state.pool, state.run_id)
                 return
             errors = 0
         except asyncio.CancelledError:
@@ -118,8 +121,10 @@ async def _read_clustered(state: _RunState) -> None:
     for _, entries in response:
         for entry_id, fields in entries:
             if FINAL in fields:
-                body = await asyncio.to_thread(gzip.compress, fields[FINAL])
-                await queries.save_result(state.pool, state.run_id, body)
+                run = await queries.get_run(state.pool, state.run_id)
+                if run is not None and run.status != "cancelling":
+                    body = await asyncio.to_thread(gzip.compress, fields[FINAL])
+                    await queries.save_result(state.pool, state.run_id, body)
                 state.worker_done = True
             elif PHASE in fields and ERROR in fields:
                 await queries.set_failed(state.pool, state.run_id, cast(Phase, fields[PHASE].decode()), fields[ERROR].decode())
@@ -138,7 +143,8 @@ async def _poll_runner(state: _RunState) -> None:
         logger.warning("polling the runner for %s failed: %s", state.run_id, e)
         if now - state.first_failed_poll >= RUNNER_MIA_SECONDS:
             await queries.set_failed(state.pool, state.run_id, "runner", "runner unreachable")
-            state.runner_done = True
+            run = await queries.get_run(state.pool, state.run_id)
+            state.runner_done = run is not None and run.status != "cancelling"
         return
 
     state.first_failed_poll = None
@@ -154,15 +160,15 @@ async def _poll_runner(state: _RunState) -> None:
         await queries.set_failed(state.pool, state.run_id, "runner", polled.error or "runner failed")
     elif polled.state == "cancelled":
         state.runner_done = True
-        await queries.set_cancelled(state.pool, state.run_id)
+        await queries.set_cancelling(state.pool, state.run_id)
     elif polled.state == "unknown":
         state.runner_done = True
         await queries.set_failed(state.pool, state.run_id, "runner", "runner has no record of this run")
 
 
-# A failed or cancelled run still needs both sides to stop before its streams can expire.
+# A failed or cancelling run needs both sides to stop before cleanup can finish.
 # The worker is told through an abort entry (it answers with an error entry), the runner through its cancel endpoint.
-async def _clean_up_stopped(state: _RunState, message: str) -> None:
+async def _request_run_shutdown(state: _RunState, message: str) -> None:
     if state.runner_done and not state.worker_done and not await _has_worker_job(state.redis, state.run_id):
         state.worker_done = True
     if not state.worker_done and not state.abort_sent:
@@ -173,7 +179,8 @@ async def _clean_up_stopped(state: _RunState, message: str) -> None:
             await runner.cancel(state.client, state.run_id)
         except RunnerUnavailable as e:
             logger.warning("cancel of %s failed: %s", state.run_id, e)
-        state.cancel_sent = True
+        else:
+            state.cancel_sent = True
 
 
 async def _has_worker_job(redis: Redis, run_id: str) -> bool:

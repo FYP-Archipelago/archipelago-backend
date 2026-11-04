@@ -10,7 +10,7 @@ from app.models import CreateRun, Phase, RunError, RunStatus, Status
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 ORDER: list[Status] = ["queued", "running", "clustering", "done"]
-NON_FINAL = ["queued", "running", "clustering"]
+PROGRESS_STATUSES = ["queued", "running", "clustering"]
 
 
 async def open_pool(url: str) -> AsyncConnectionPool:
@@ -93,15 +93,15 @@ async def set_failed(pool: AsyncConnectionPool, run_id: str, phase: Phase, messa
     async with pool.connection() as conn:
         await conn.execute(
             "UPDATE runs SET status = 'failed', error_phase = %s, error_message = %s, updated_at = now() WHERE run_id = %s AND status = ANY(%s)",
-            (phase, message, run_id, NON_FINAL),
+            (phase, message, run_id, PROGRESS_STATUSES),
         )
 
 
-async def set_cancelled(pool: AsyncConnectionPool, run_id: str) -> None:
+async def set_cancelling(pool: AsyncConnectionPool, run_id: str) -> None:
     async with pool.connection() as conn:
         await conn.execute(
-            "UPDATE runs SET status = 'cancelled', updated_at = now() WHERE run_id = %s AND status = ANY(%s)",
-            (run_id, NON_FINAL),
+            "UPDATE runs SET status = 'cancelling', updated_at = now() WHERE run_id = %s AND status = ANY(%s)",
+            (run_id, PROGRESS_STATUSES),
         )
 
 
@@ -109,16 +109,20 @@ async def save_result(pool: AsyncConnectionPool, run_id: str, body: bytes) -> No
     async with pool.connection() as conn, conn.transaction():
         cur = await conn.execute(
             "UPDATE runs SET status = 'done', updated_at = now() WHERE run_id = %s AND status = ANY(%s)",
-            (run_id, NON_FINAL),
+            (run_id, PROGRESS_STATUSES),
         )
         if cur.rowcount == 0:
             return
         await conn.execute("INSERT INTO results (run_id, body) VALUES (%s, %s)", (run_id, body))
 
 
-async def mark_streams_expired(pool: AsyncConnectionPool, run_id: str) -> None:
+async def finish_cleanup(pool: AsyncConnectionPool, run_id: str) -> None:
     async with pool.connection() as conn:
-        await conn.execute("UPDATE runs SET streams_expired = true, updated_at = now() WHERE run_id = %s", (run_id,))
+        await conn.execute(
+            "UPDATE runs SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' ELSE status END, "
+            "streams_expired = true, updated_at = now() WHERE run_id = %s",
+            (run_id,),
+        )
 
 
 async def list_unexpired(pool: AsyncConnectionPool) -> list[str]:

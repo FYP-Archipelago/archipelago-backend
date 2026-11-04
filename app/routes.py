@@ -131,19 +131,10 @@ async def cancel_run(run_id: str, request: Request, response: Response) -> RunSt
         raise HTTPException(404, "run not found")
     if run.status in ("done", "failed", "cancelled"):
         return run
-    # in clustering the runner is already done, so only the worker is left
-    if run.status != "clustering":
-        try:
-            cancelled = await runner.cancel(state.runner, run_id)
-        except RunnerUnavailable as e:
-            raise HTTPException(502, str(e)) from e
-        # failed or unknown means the run is over anyway: the supervisor settles those from here
-        if cancelled.state not in ("running", "cancelled", "finished"):
-            return run
-    # a worker still clustering can't be interrupted, but its result is not saved for a cancelled run
-    await queries.set_cancelled(state.pool, run_id)
+    if run.status != "cancelling":
+        await queries.set_cancelling(state.pool, run_id)
     updated = await queries.get_run(state.pool, run_id) or run
-    if updated.status == "cancelled":
+    if updated.status == "cancelling":
         response.status_code = 202
     return updated
 
@@ -163,20 +154,44 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
         after = last_event_id if STREAM_ID.fullmatch(last_event_id) else "0-0"
         last_output = time.monotonic()
         yield _sse("status", json.dumps({"status": status}).encode())
+        if status == "cancelled":
+            return
         while not await request.is_disconnected():
             response = await redis.xread({key: after}, block=SSE_BLOCK_MS)
+            current = await queries.get_run(state.pool, run_id)
+            if current is None:
+                return
+            if current.status in ("cancelling", "cancelled"):
+                if current.status != status:
+                    status = current.status
+                    last_output = time.monotonic()
+                    yield _sse("status", json.dumps({"status": status}).encode())
+                for _, entries in response:
+                    if entries:
+                        after = entries[-1][0].decode()
+                if status == "cancelled":
+                    return
+                if time.monotonic() - last_output >= KEEPALIVE_SECONDS:
+                    yield b": keep-alive\n\n"
+                    last_output = time.monotonic()
+                continue
             for _, entries in response:
                 for entry_id, fields in entries:
                     after = entry_id.decode()
+                    if status == "cancelling":
+                        continue
                     if UPDATE in fields:
                         yield _sse("update", fields[UPDATE], entry_id)
                     elif FINAL in fields or (PHASE in fields and ERROR in fields):
                         current = await queries.get_run(state.pool, run_id)
-                        # a cancelled run ends with its status: the error entry is the worker's "run cancelled" and a final is stale
-                        if current is not None and current.status == "cancelled":
-                            if status != "cancelled":
-                                yield _sse("status", json.dumps({"status": "cancelled"}).encode())
-                            return
+                        # Cancellation acknowledgements and late results do not end an unfinished cancellation.
+                        if current is not None and current.status in ("cancelling", "cancelled"):
+                            if current.status != status:
+                                status = current.status
+                                yield _sse("status", json.dumps({"status": status}).encode())
+                            if status == "cancelled":
+                                return
+                            continue
                         if FINAL not in fields:
                             yield _sse("error", json.dumps({"phase": fields[PHASE].decode(), "message": fields[ERROR].decode()}).encode())
                             return
