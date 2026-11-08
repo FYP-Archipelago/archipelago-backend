@@ -96,3 +96,26 @@ async def login(body: LoginRequest, request: Request, response: Response) -> Ses
 @router.get("/me")
 async def current_user(current: CurrentSession) -> SessionResponse:
     return _session_response(*current)
+
+
+@router.post("/refresh")
+async def refresh_session(request: Request, response: Response) -> SessionResponse:
+    token = request.cookies.get(REFRESH_COOKIE_NAME, "")
+    if not token:
+        raise HTTPException(401, "Invalid or expired refresh token")
+    state = request.app.state
+    async with state.pool.connection() as conn, conn.transaction():
+        session = await auth.lock_session_by_refresh_hash(conn, security.hash_token(token))
+        # Checks expiry after acquiring the lock, including time spent waiting for another request.
+        now = datetime.now(UTC)
+        if session is None or session.refresh_expires_at <= now:
+            raise HTTPException(401, "Invalid or expired refresh token")
+        user = await auth.get_user(conn, session.user_id)
+        if user is None:
+            raise HTTPException(401, "Invalid or expired refresh token")
+        access, refresh = security.mint_token(), security.mint_token()
+        session = await auth.rotate_session(
+            conn, session.id, security.hash_token(access), security.hash_token(refresh), min(now + ACCESS_LIFETIME, session.refresh_expires_at)
+        )
+    _set_cookies(response, state.settings, session, access, refresh)
+    return _session_response(user, session)

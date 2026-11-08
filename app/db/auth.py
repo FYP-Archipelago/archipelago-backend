@@ -63,6 +63,24 @@ async def get_session_by_refresh_hash(conn: AsyncConnection[dict[str, Any]], tok
     return Session(**row) if row else None
 
 
+async def lock_session_by_refresh_hash(conn: AsyncConnection[dict[str, Any]], token_hash: bytes) -> Session | None:
+    cur = await conn.execute("SELECT * FROM auth_sessions WHERE refresh_token_hash = %s FOR UPDATE", (token_hash,))
+    row = await cur.fetchone()
+    return Session(**row) if row else None
+
+
+async def rotate_session(
+    conn: AsyncConnection[dict[str, Any]], session_id: UUID, access_token_hash: bytes, refresh_token_hash: bytes, access_expires_at: datetime
+) -> Session:
+    cur = await conn.execute(
+        "UPDATE auth_sessions SET access_token_hash = %s, refresh_token_hash = %s, access_expires_at = %s WHERE id = %s RETURNING *",
+        (access_token_hash, refresh_token_hash, access_expires_at, session_id),
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return Session(**row)
+
+
 async def delete_session(conn: AsyncConnection[dict[str, Any]], session_id: UUID) -> bool:
     cur = await conn.execute("DELETE FROM auth_sessions WHERE id = %s", (session_id,))
     return cur.rowcount > 0
