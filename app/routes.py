@@ -17,7 +17,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from app import __version__, runner
-from app.db import queries
+from app.db import runs
 from app.ids import is_run_id, mint_run_id
 from app.models import CreateRun, RunPage, RunStatus, Status
 from app.redis_names import ERROR, FINAL, JOB_CONFIG, JOB_RUN_ID, JOB_STREAM, PENDING_RUNS, PHASE, UPDATE, clustered_key
@@ -73,7 +73,7 @@ async def get_presets(request: Request) -> Response:
 async def create_run(body: CreateRun, request: Request) -> RunStatus:
     state: Any = request.app.state
     redis: Redis = state.redis
-    run = await queries.insert_run(state.pool, mint_run_id(), body)
+    run = await runs.insert_run(state.pool, mint_run_id(), body)
     # enqueue before starting the runner: if the API dies in between, what's left is a waiting job
     # that recovery cleans up, not an EA running with logs that never expire
     await redis.xadd(
@@ -83,19 +83,19 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
     try:
         started = await runner.start(state.runner, run.run_id, run.preset, run.overrides)
     except RunnerRejected as e:
-        await queries.set_failed(state.pool, run.run_id, "runner", str(e))
+        await runs.set_failed(state.pool, run.run_id, "runner", str(e))
         # a worker may already hold the job, and the abort makes it let go
         await write_abort(redis, run.run_id, str(e))
         start_supervisor(run.run_id, state.pool, redis, state.runner, runner_done=True, abort_sent=True)
         raise HTTPException(422, str(e)) from e
     except RunnerUnavailable as e:
-        await queries.set_failed(state.pool, run.run_id, "runner", str(e))
+        await runs.set_failed(state.pool, run.run_id, "runner", str(e))
         await write_abort(redis, run.run_id, str(e))
         # the start may have reached the runner before the error, so the supervisor still polls and cancels it
         start_supervisor(run.run_id, state.pool, redis, state.runner, abort_sent=True)
         raise HTTPException(502, str(e)) from e
     if started.state == "running":
-        await queries.advance_status(state.pool, run.run_id, "running")
+        await runs.advance_status(state.pool, run.run_id, "running")
         run = run.model_copy(update={"status": "running"})
     start_supervisor(run.run_id, state.pool, redis, state.runner)
     return run
@@ -109,15 +109,15 @@ async def list_runs(
     cursor: str | None = None,
 ) -> RunPage:
     before = _decode_cursor(cursor) if cursor is not None else None
-    rows = await queries.list_runs(request.app.state.pool, RUNS_PAGE_SIZE + 1, status, preset, before)
+    rows = await runs.list_runs(request.app.state.pool, RUNS_PAGE_SIZE + 1, status, preset, before)
     more = len(rows) > RUNS_PAGE_SIZE
-    runs = rows[:RUNS_PAGE_SIZE]
-    return RunPage(runs=runs, next_cursor=_encode_cursor(runs[-1]) if more else None)
+    page = rows[:RUNS_PAGE_SIZE]
+    return RunPage(runs=page, next_cursor=_encode_cursor(page[-1]) if more else None)
 
 
 @router.get("/runs/{run_id}", response_model=RunStatus)
 async def get_run(run_id: str, request: Request) -> RunStatus:
-    run = await queries.get_run(request.app.state.pool, run_id) if is_run_id(run_id) else None
+    run = await runs.get_run(request.app.state.pool, run_id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
     return run
@@ -126,14 +126,14 @@ async def get_run(run_id: str, request: Request) -> RunStatus:
 @router.post("/runs/{run_id}/cancel", responses={202: {"model": RunStatus}})
 async def cancel_run(run_id: str, request: Request, response: Response) -> RunStatus:
     state: Any = request.app.state
-    run = await queries.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    run = await runs.get_run(state.pool, run_id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
     if run.status in ("done", "failed", "cancelled"):
         return run
     if run.status != "cancelling":
-        await queries.set_cancelling(state.pool, run_id)
-    updated = await queries.get_run(state.pool, run_id) or run
+        await runs.set_cancelling(state.pool, run_id)
+    updated = await runs.get_run(state.pool, run_id) or run
     if updated.status == "cancelling":
         response.status_code = 202
     return updated
@@ -143,7 +143,7 @@ async def cancel_run(run_id: str, request: Request, response: Response) -> RunSt
 async def run_events(run_id: str, request: Request) -> StreamingResponse:
     state: Any = request.app.state
     redis: Redis = state.redis
-    run = await queries.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    run = await runs.get_run(state.pool, run_id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
     last_event_id = request.headers.get("last-event-id", "")
@@ -158,7 +158,7 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
             return
         while not await request.is_disconnected():
             response = await redis.xread({key: after}, block=SSE_BLOCK_MS)
-            current = await queries.get_run(state.pool, run_id)
+            current = await runs.get_run(state.pool, run_id)
             if current is None:
                 return
             if current.status in ("cancelling", "cancelled"):
@@ -183,7 +183,7 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                     if UPDATE in fields:
                         yield _sse("update", fields[UPDATE], entry_id)
                     elif FINAL in fields or (PHASE in fields and ERROR in fields):
-                        current = await queries.get_run(state.pool, run_id)
+                        current = await runs.get_run(state.pool, run_id)
                         # Cancellation acknowledgements and late results do not end an unfinished cancellation.
                         if current is not None and current.status in ("cancelling", "cancelled"):
                             if current.status != status:
@@ -202,7 +202,7 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                         yield _sse("final", fields[FINAL], entry_id)
                         return
 
-            current = await queries.get_run(state.pool, run_id)
+            current = await runs.get_run(state.pool, run_id)
             if current is None:
                 return
             if response or current.status != status:
@@ -227,10 +227,10 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
 @router.get("/runs/{run_id}/result", responses={200: {"model": Result}})
 async def run_result(run_id: str, request: Request) -> Response:
     state: Any = request.app.state
-    run = await queries.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    run = await runs.get_run(state.pool, run_id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
-    body = await queries.get_result_body(state.pool, run_id)
+    body = await runs.get_result_body(state.pool, run_id)
     if body is None:
         raise HTTPException(404, f"no result: run {run.status}" if run.status in ("failed", "cancelled") else f"no result: run is {run.status}")
     headers = {"Vary": "Accept-Encoding"}

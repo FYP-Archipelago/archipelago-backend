@@ -11,7 +11,7 @@ from psycopg_pool import AsyncConnectionPool
 from redis.asyncio import Redis
 
 from app import runner
-from app.db import queries
+from app.db import runs
 from app.models import Phase
 from app.redis_names import ABORT, DATA, ERROR, FINAL, JOB_RUN_ID, KIND, PENDING_RUNS, PHASE, clustered_key, runner_logs_key
 from app.runner import RunnerUnavailable
@@ -81,7 +81,7 @@ async def _supervise(state: _RunState) -> None:
                 await _poll_runner(state)
                 polled_runner = True
 
-            run = await queries.get_run(state.pool, state.run_id)
+            run = await runs.get_run(state.pool, state.run_id)
             if run is None:
                 return
             # a done run's result is saved, even if its streams expired before the API last stopped
@@ -98,7 +98,7 @@ async def _supervise(state: _RunState) -> None:
             if state.runner_done and state.worker_done and not await _has_worker_job(state.redis, state.run_id):
                 await state.redis.expire(runner_logs_key(state.run_id), STREAM_TTL_SECONDS)
                 await state.redis.expire(clustered_key(state.run_id), STREAM_TTL_SECONDS)
-                await queries.finish_cleanup(state.pool, state.run_id)
+                await runs.finish_cleanup(state.pool, state.run_id)
                 return
             errors = 0
         except asyncio.CancelledError:
@@ -109,7 +109,7 @@ async def _supervise(state: _RunState) -> None:
             logger.exception("supervisor of %s hit an error (%d in a row)", state.run_id, errors)
             if errors >= MAX_ERRORS:
                 try:
-                    await queries.set_failed(state.pool, state.run_id, "internal", f"{type(e).__name__}: {e}")
+                    await runs.set_failed(state.pool, state.run_id, "internal", f"{type(e).__name__}: {e}")
                 except Exception:
                     logger.exception("marking %s failed raised too", state.run_id)
             await asyncio.sleep(ERROR_RETRY_SECONDS)
@@ -121,13 +121,13 @@ async def _read_clustered(state: _RunState) -> None:
     for _, entries in response:
         for entry_id, fields in entries:
             if FINAL in fields:
-                run = await queries.get_run(state.pool, state.run_id)
+                run = await runs.get_run(state.pool, state.run_id)
                 if run is not None and run.status != "cancelling":
                     body = await asyncio.to_thread(gzip.compress, fields[FINAL])
-                    await queries.save_result(state.pool, state.run_id, body)
+                    await runs.save_result(state.pool, state.run_id, body)
                 state.worker_done = True
             elif PHASE in fields and ERROR in fields:
-                await queries.set_failed(state.pool, state.run_id, cast(Phase, fields[PHASE].decode()), fields[ERROR].decode())
+                await runs.set_failed(state.pool, state.run_id, cast(Phase, fields[PHASE].decode()), fields[ERROR].decode())
                 state.worker_done = True
             # only past an entry once it's handled, so a failed save is read and retried next loop
             state.last_id = entry_id.decode()
@@ -142,28 +142,28 @@ async def _poll_runner(state: _RunState) -> None:
         state.first_failed_poll = state.first_failed_poll or now
         logger.warning("polling the runner for %s failed: %s", state.run_id, e)
         if now - state.first_failed_poll >= RUNNER_MIA_SECONDS:
-            await queries.set_failed(state.pool, state.run_id, "runner", "runner unreachable")
-            run = await queries.get_run(state.pool, state.run_id)
+            await runs.set_failed(state.pool, state.run_id, "runner", "runner unreachable")
+            run = await runs.get_run(state.pool, state.run_id)
             state.runner_done = run is not None and run.status != "cancelling"
         return
 
     state.first_failed_poll = None
     if polled.state == "running":
-        await queries.advance_status(state.pool, state.run_id, "running")
+        await runs.advance_status(state.pool, state.run_id, "running")
     elif polled.state == "finished":
         state.runner_done = True
-        run = await queries.get_run(state.pool, state.run_id)
+        run = await runs.get_run(state.pool, state.run_id)
         if run is not None and not run.stream:
-            await queries.advance_status(state.pool, state.run_id, "clustering")
+            await runs.advance_status(state.pool, state.run_id, "clustering")
     elif polled.state == "failed":
         state.runner_done = True
-        await queries.set_failed(state.pool, state.run_id, "runner", polled.error or "runner failed")
+        await runs.set_failed(state.pool, state.run_id, "runner", polled.error or "runner failed")
     elif polled.state == "cancelled":
         state.runner_done = True
-        await queries.set_cancelling(state.pool, state.run_id)
+        await runs.set_cancelling(state.pool, state.run_id)
     elif polled.state == "unknown":
         state.runner_done = True
-        await queries.set_failed(state.pool, state.run_id, "runner", "runner has no record of this run")
+        await runs.set_failed(state.pool, state.run_id, "runner", "runner has no record of this run")
 
 
 # A failed or cancelling run needs both sides to stop before cleanup can finish.

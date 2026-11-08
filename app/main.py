@@ -9,7 +9,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from app import __version__, runner
-from app.db import queries
+from app.db import apply_schema, open_pool, runs
 from app.redis_names import GROUP, PENDING_RUNS
 from app.routes import router
 from app.settings import load_settings
@@ -25,8 +25,8 @@ settings = load_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    pool = await queries.open_pool(settings.database_url)
-    await queries.apply_schema(pool)
+    pool = await open_pool(settings.database_url)
+    await apply_schema(pool)
     # a pooled connection that died (e.g. Redis restarted) is reopened and the command retried once
     redis = Redis.from_url(settings.redis_url, decode_responses=False, max_connections=REDIS_MAX_CONNECTIONS, retry_on_error=[RedisConnectionError])
     try:
@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     app.state.redis = redis
     app.state.runner = client
 
-    for run_id in await queries.list_unexpired(pool):
+    for run_id in await runs.list_unexpired(pool):
         start_supervisor(run_id, pool, redis, client)
 
     yield

@@ -1,27 +1,13 @@
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from app.models import CreateRun, Phase, RunError, RunStatus, Status
 
-SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 ORDER: list[Status] = ["queued", "running", "clustering", "done"]
 PROGRESS_STATUSES = ["queued", "running", "clustering"]
-
-
-async def open_pool(url: str) -> AsyncConnectionPool:
-    pool = AsyncConnectionPool(url, open=False, kwargs={"row_factory": dict_row})
-    await pool.open(wait=True)
-    return pool
-
-
-async def apply_schema(pool: AsyncConnectionPool) -> None:
-    async with pool.connection() as conn:
-        await conn.execute(SCHEMA_PATH.read_text())
 
 
 def _to_run_status(row: dict[str, Any]) -> RunStatus:
