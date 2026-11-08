@@ -78,14 +78,9 @@ async def status(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:
     return RunnerStatus(state=body["state"], error=body.get("error"))
 
 
-async def cancel(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:
+async def cancel(client: httpx.AsyncClient, run_id: str) -> None:
     response = await _request(client, "POST", f"/runs/{run_id}/cancel")
     if response.status_code == 404:
-        return RunnerStatus(state="unknown", error=None)
+        return
     if not response.is_success:
         raise RunnerUnavailable(f"runner answered {response.status_code} to the cancel: {_error_text(response)}")
-    try:
-        body = response.json()
-        return RunnerStatus(state=body["state"], error=body.get("error"))
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
-        raise RunnerUnavailable(f"runner gave an unreadable answer to the cancel: {response.text[:200]}") from e

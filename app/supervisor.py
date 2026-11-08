@@ -12,7 +12,7 @@ from redis.asyncio import Redis
 
 from app import runner
 from app.db import runs
-from app.models import Phase
+from app.models.runs import Phase
 from app.redis_names import ABORT, DATA, ERROR, FINAL, JOB_RUN_ID, KIND, PENDING_RUNS, PHASE, clustered_key, runner_logs_key
 from app.runner import RunnerUnavailable
 
@@ -101,8 +101,6 @@ async def _supervise(state: _RunState) -> None:
                 await runs.finish_cleanup(state.pool, state.run_id)
                 return
             errors = 0
-        except asyncio.CancelledError:
-            raise
         except Exception as e:
             # a short Redis or Postgres outage only fails the run if it outlasts a few retries
             errors += 1

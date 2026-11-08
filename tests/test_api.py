@@ -12,7 +12,7 @@ from archipelago import Config
 from app import runner as runner_client
 from app.db import runs
 from app.main import app
-from app.models import CreateRun
+from app.models.runs import CreateRun
 from tests.conftest import FakeRunner
 
 pytestmark = pytest.mark.anyio

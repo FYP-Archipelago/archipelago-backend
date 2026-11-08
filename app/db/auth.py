@@ -1,31 +1,10 @@
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 from psycopg import AsyncConnection
 
-
-@dataclass(frozen=True)
-class User:
-    id: UUID
-    email: str
-    password_hash: str = field(repr=False)
-    full_name: str
-    institution: str | None
-    created_at: datetime
-
-
-@dataclass(frozen=True)
-class Session:
-    id: UUID
-    user_id: UUID
-    access_token_hash: bytes = field(repr=False)
-    refresh_token_hash: bytes = field(repr=False)
-    csrf_token: str = field(repr=False)
-    created_at: datetime
-    access_expires_at: datetime
-    refresh_expires_at: datetime
+from app.models.auth import Session, User
 
 
 async def insert_user(conn: AsyncConnection[dict[str, Any]], email: str, password_hash: str, full_name: str, institution: str | None = None) -> User:

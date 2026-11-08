@@ -4,7 +4,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from app.models import CreateRun, Phase, RunError, RunStatus, Status
+from app.models.runs import CreateRun, Phase, RunError, RunStatus, Status
 
 ORDER: list[Status] = ["queued", "running", "clustering", "done"]
 PROGRESS_STATUSES = ["queued", "running", "clustering"]

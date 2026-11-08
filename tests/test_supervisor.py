@@ -12,7 +12,7 @@ import redis
 from app import supervisor
 from app.db import runs
 from app.main import app
-from app.models import CreateRun
+from app.models.runs import CreateRun
 from tests.conftest import FakeRunner
 
 pytestmark = pytest.mark.anyio
