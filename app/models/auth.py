@@ -1,39 +1,26 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, StringConstraints, field_validator
 
-
-@dataclass(frozen=True)
-class User:
-    id: UUID
-    email: str
-    password_hash: str = field(repr=False)
-    full_name: str
-    institution: str | None
-    created_at: datetime
+Email = Annotated[EmailStr, AfterValidator(str.lower)]
+PasswordDigest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
 
 @dataclass(frozen=True)
 class Session:
     id: UUID
     user_id: UUID
-    access_token_hash: bytes = field(repr=False)
-    refresh_token_hash: bytes = field(repr=False)
-    csrf_token: str = field(repr=False)
-    created_at: datetime
+    access_token_hash: bytes
+    csrf_token: str
     access_expires_at: datetime
     refresh_expires_at: datetime
 
 
-Email = Annotated[EmailStr, Field(max_length=254)]
-PasswordDigest = Annotated[str, Field(repr=False, min_length=64, max_length=64, pattern=r"^[0-9a-f]+$")]
-
-
 class RegisterRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    model_config = ConfigDict(extra="forbid")
 
     email: Email
     password_digest: PasswordDigest
@@ -47,15 +34,13 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    model_config = ConfigDict(extra="forbid")
 
     email: Email
     password_digest: PasswordDigest
 
 
-class UserResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+class User(BaseModel):
     id: UUID
     email: str
     full_name: str
@@ -64,7 +49,7 @@ class UserResponse(BaseModel):
 
 
 class SessionResponse(BaseModel):
-    user: UserResponse
-    csrf_token: str = Field(repr=False)
+    user: User
+    csrf_token: str
     access_expires_at: datetime
     refresh_expires_at: datetime

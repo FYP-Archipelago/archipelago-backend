@@ -69,8 +69,7 @@ async def cancel_all() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-# Looks after one run until both of its streams have a TTL: saves the result, follows the
-# runner's state, and cleans up after a failure on either side.
+# Looks after one run until both its streams have a TTL: saves the result, follows the runner's state, and cleans up after a failure on either side.
 async def _supervise(state: _RunState) -> None:
     errors = 0
     while True:
@@ -84,17 +83,16 @@ async def _supervise(state: _RunState) -> None:
             run = await runs.get_run(state.pool, state.run_id)
             if run is None:
                 return
-            # a done run's result is saved, even if its streams expired before the API last stopped
+            # A done run's result is saved, even if its streams expired before the API last stopped
             if run.status == "done":
                 state.worker_done = True
             if run.status in ("failed", "cancelling", "cancelled"):
                 if run.status == "cancelling" and polled_runner and not state.runner_done:
                     state.cancel_sent = False
                 state.cancel_sent = state.cancel_sent or run.status == "cancelled"
-                await _request_run_shutdown(state, run.error.message if run.error else "run cancelled")
+                await _request_run_shutdown(state, run.error.message if run.error else "Run cancelled")
 
-            # EXPIRE deletes the key, and a later XADD recreates it with no TTL, so wait until
-            # neither the runner nor the worker can write to these streams again
+            # EXPIRE deletes the key and a later XADD would recreate it with no TTL, so wait until neither side can write again
             if state.runner_done and state.worker_done and not await _has_worker_job(state.redis, state.run_id):
                 await state.redis.expire(runner_logs_key(state.run_id), STREAM_TTL_SECONDS)
                 await state.redis.expire(clustered_key(state.run_id), STREAM_TTL_SECONDS)
@@ -102,7 +100,7 @@ async def _supervise(state: _RunState) -> None:
                 return
             errors = 0
         except Exception as e:
-            # a short Redis or Postgres outage only fails the run if it outlasts a few retries
+            # A short Redis or Postgres outage only fails the run if it outlasts a few retries
             errors += 1
             logger.exception("supervisor of %s hit an error (%d in a row)", state.run_id, errors)
             if errors >= MAX_ERRORS:
@@ -114,7 +112,7 @@ async def _supervise(state: _RunState) -> None:
 
 
 async def _read_clustered(state: _RunState) -> None:
-    # blocks up to 2 s, which also paces the supervisor loop
+    # Blocks up to 2 s, which also paces the supervisor loop
     response = await state.redis.xread({clustered_key(state.run_id): state.last_id}, block=2000)
     for _, entries in response:
         for entry_id, fields in entries:
@@ -127,7 +125,7 @@ async def _read_clustered(state: _RunState) -> None:
             elif PHASE in fields and ERROR in fields:
                 await runs.set_failed(state.pool, state.run_id, cast(Phase, fields[PHASE].decode()), fields[ERROR].decode())
                 state.worker_done = True
-            # only past an entry once it's handled, so a failed save is read and retried next loop
+            # Only past an entry once it's handled, so a failed save is read and retried next loop
             state.last_id = entry_id.decode()
 
 
@@ -140,7 +138,7 @@ async def _poll_runner(state: _RunState) -> None:
         state.first_failed_poll = state.first_failed_poll or now
         logger.warning("polling the runner for %s failed: %s", state.run_id, e)
         if now - state.first_failed_poll >= RUNNER_MIA_SECONDS:
-            await runs.set_failed(state.pool, state.run_id, "runner", "runner unreachable")
+            await runs.set_failed(state.pool, state.run_id, "runner", "Runner unreachable")
             run = await runs.get_run(state.pool, state.run_id)
             state.runner_done = run is not None and run.status != "cancelling"
         return
@@ -155,13 +153,13 @@ async def _poll_runner(state: _RunState) -> None:
             await runs.advance_status(state.pool, state.run_id, "clustering")
     elif polled.state == "failed":
         state.runner_done = True
-        await runs.set_failed(state.pool, state.run_id, "runner", polled.error or "runner failed")
+        await runs.set_failed(state.pool, state.run_id, "runner", polled.error or "Runner failed")
     elif polled.state == "cancelled":
         state.runner_done = True
         await runs.set_cancelling(state.pool, state.run_id)
     elif polled.state == "unknown":
         state.runner_done = True
-        await runs.set_failed(state.pool, state.run_id, "runner", "runner has no record of this run")
+        await runs.set_failed(state.pool, state.run_id, "runner", "Runner has no record of this run")
 
 
 # A failed or cancelling run needs both sides to stop before cleanup can finish.

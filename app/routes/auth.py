@@ -1,142 +1,79 @@
-from datetime import UTC, datetime, timedelta
-from typing import Any
-from uuid import UUID
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, HTTPException, Request, Response
-from psycopg import AsyncConnection
-from psycopg.errors import UniqueViolation
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from app import security
-from app.db import auth
-from app.dependencies import CurrentSession
-from app.models.auth import LoginRequest, RegisterRequest, Session, SessionResponse, User, UserResponse
-from app.settings import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME, Settings
+from app.auth import ACCESS_COOKIE, REFRESH_COOKIE, CurrentSession, hash_token, mint_token, passwords, require_origin
+from app.db import auth as auth_db
+from app.models.auth import LoginRequest, RegisterRequest, Session, SessionResponse, User
 
-ACCESS_LIFETIME = timedelta(hours=4)
-REFRESH_LIFETIME = timedelta(days=30)
-
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/auth")
 
 
-def _session_response(user: User, session: Session) -> SessionResponse:
+def _body(user: User, session: Session) -> SessionResponse:
     return SessionResponse(
-        user=UserResponse.model_validate(user),
-        csrf_token=session.csrf_token,
-        access_expires_at=session.access_expires_at,
-        refresh_expires_at=session.refresh_expires_at,
+        user=user, csrf_token=session.csrf_token, access_expires_at=session.access_expires_at, refresh_expires_at=session.refresh_expires_at
     )
 
 
-async def _get_cookie_session(conn: AsyncConnection[dict[str, Any]], request: Request) -> Session | None:
+def _set_cookies(response: Response, secure: bool, session: Session, access: str, refresh: str) -> None:
     now = datetime.now(UTC)
-    session = None
-    refresh = request.cookies.get(REFRESH_COOKIE_NAME, "")
-    access = request.cookies.get(ACCESS_COOKIE_NAME, "")
-    if refresh:
-        session = await auth.get_session_by_refresh_hash(conn, security.hash_token(refresh), now)
-    if session is None and access:
-        session = await auth.get_session_by_access_hash(conn, security.hash_token(access), now)
-    return session
+    for name, token, expires in ((ACCESS_COOKIE, access, session.access_expires_at), (REFRESH_COOKIE, refresh, session.refresh_expires_at)):
+        response.set_cookie(name, token, max_age=int((expires - now).total_seconds()), secure=secure, httponly=True, samesite="lax")
 
 
-async def _create_session(conn: AsyncConnection[dict[str, Any]], user_id: UUID, request: Request) -> tuple[Session, str, str]:
-    previous = await _get_cookie_session(conn, request)
-    if previous is not None:
-        await auth.delete_session(conn, previous.id)
-
-    now = datetime.now(UTC)
-    access, refresh = security.mint_token(), security.mint_token()
-    session = await auth.insert_session(
-        conn, user_id, security.hash_token(access), security.hash_token(refresh), security.mint_token(), now + ACCESS_LIFETIME, now + REFRESH_LIFETIME
-    )
-    return session, access, refresh
-
-
-def _set_cookies(response: Response, settings: Settings, session: Session, access: str, refresh: str) -> None:
-    now = datetime.now(UTC)
-    for name, token, expires in (
-        (ACCESS_COOKIE_NAME, access, session.access_expires_at),
-        (REFRESH_COOKIE_NAME, refresh, session.refresh_expires_at),
-    ):
-        response.set_cookie(
-            name,
-            token,
-            max_age=max(0, int((expires - now).total_seconds())),
-            expires=expires,
-            secure=settings.cookie_secure,
-            httponly=True,
-            samesite="lax",
-            path="/",
-        )
+async def _start_session(request: Request, response: Response, user: User) -> SessionResponse:
+    state = request.app.state
+    # A login replaces this browser's previous session rather than leaving it valid until it expires
+    previous = request.cookies.get(REFRESH_COOKIE)
+    if previous:
+        await auth_db.delete_session(state.pool, hash_token(previous))
+    access, refresh = mint_token(), mint_token()
+    session = await auth_db.create_session(state.pool, user.id, hash_token(access), hash_token(refresh), mint_token())
+    _set_cookies(response, state.settings.cookie_secure, session, access, refresh)
+    return _body(user, session)
 
 
-@router.post("/register", status_code=201)
+@router.post("/register", status_code=201, dependencies=[Depends(require_origin)])
 async def register(body: RegisterRequest, request: Request, response: Response) -> SessionResponse:
-    state = request.app.state
-    password_hash = security.hash_password(body.password_digest)
-    try:
-        async with state.pool.connection() as conn, conn.transaction():
-            user = await auth.insert_user(conn, body.email, password_hash, body.full_name, body.institution)
-            session, access, refresh = await _create_session(conn, user.id, request)
-    except UniqueViolation as error:
-        if error.diag.constraint_name == "users_email_key":
-            raise HTTPException(409, "Email already registered") from None
-        raise
-    _set_cookies(response, state.settings, session, access, refresh)
-    return _session_response(user, session)
+    password_hash = passwords.hash(body.password_digest)
+    user = await auth_db.create_user(request.app.state.pool, body.email, password_hash, body.full_name, body.institution)
+    if user is None:
+        raise HTTPException(409, "Email already registered")
+    return await _start_session(request, response, user)
 
 
-@router.post("/login")
+@router.post("/login", dependencies=[Depends(require_origin)])
 async def login(body: LoginRequest, request: Request, response: Response) -> SessionResponse:
-    state = request.app.state
-    async with state.pool.connection() as conn:
-        user = await auth.get_user_by_email(conn, body.email)
-    if user is None or not security.verify_password(body.password_digest, user.password_hash):
-        raise HTTPException(401, "Invalid email or password")
-    async with state.pool.connection() as conn, conn.transaction():
-        session, access, refresh = await _create_session(conn, user.id, request)
-    _set_cookies(response, state.settings, session, access, refresh)
-    return _session_response(user, session)
+    found = await auth_db.get_login(request.app.state.pool, body.email)
+    if found is not None:
+        user, password_hash = found
+        if passwords.verify(body.password_digest, password_hash):
+            return await _start_session(request, response, user)
+    raise HTTPException(401, "Invalid email or password")
 
 
 @router.get("/me")
-async def current_user(current: CurrentSession) -> SessionResponse:
-    return _session_response(*current)
+async def me(request: Request, session: CurrentSession) -> SessionResponse:
+    return _body(await auth_db.get_user(request.app.state.pool, session.user_id), session)
 
 
-@router.post("/refresh")
+@router.post("/refresh", dependencies=[Depends(require_origin)])
 async def refresh_session(request: Request, response: Response) -> SessionResponse:
-    token = request.cookies.get(REFRESH_COOKIE_NAME, "")
-    if not token:
+    state = request.app.state
+    token = request.cookies.get(REFRESH_COOKIE)
+    access, refresh = mint_token(), mint_token()
+    session = await auth_db.refresh_session(state.pool, hash_token(token), hash_token(access), hash_token(refresh)) if token else None
+    if session is None:
         raise HTTPException(401, "Invalid or expired refresh token")
+    _set_cookies(response, state.settings.cookie_secure, session, access, refresh)
+    return _body(await auth_db.get_user(state.pool, session.user_id), session)
+
+
+@router.post("/logout", status_code=204, dependencies=[Depends(require_origin)])
+async def logout(request: Request, response: Response) -> None:
     state = request.app.state
-    async with state.pool.connection() as conn, conn.transaction():
-        session = await auth.lock_session_by_refresh_hash(conn, security.hash_token(token))
-        # Checks expiry after acquiring the lock, including time spent waiting for another request.
-        now = datetime.now(UTC)
-        if session is None or session.refresh_expires_at <= now:
-            raise HTTPException(401, "Invalid or expired refresh token")
-        user = await auth.get_user(conn, session.user_id)
-        if user is None:
-            raise HTTPException(401, "Invalid or expired refresh token")
-        access, refresh = security.mint_token(), security.mint_token()
-        session = await auth.rotate_session(
-            conn, session.id, security.hash_token(access), security.hash_token(refresh), min(now + ACCESS_LIFETIME, session.refresh_expires_at)
-        )
-    _set_cookies(response, state.settings, session, access, refresh)
-    return _session_response(user, session)
-
-
-@router.post("/logout", status_code=204)
-async def logout(request: Request) -> Response:
-    state = request.app.state
-    if request.cookies.get(REFRESH_COOKIE_NAME) or request.cookies.get(ACCESS_COOKIE_NAME):
-        async with state.pool.connection() as conn, conn.transaction():
-            session = await _get_cookie_session(conn, request)
-            if session is not None:
-                await auth.delete_session(conn, session.id)
-
-    response = Response(status_code=204)
-    for name in (ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME):
-        response.delete_cookie(name, path="/", secure=state.settings.cookie_secure, httponly=True, samesite="lax")
-    return response
+    token = request.cookies.get(REFRESH_COOKIE)
+    if token:
+        await auth_db.delete_session(state.pool, hash_token(token))
+    for name in (ACCESS_COOKIE, REFRESH_COOKIE):
+        response.delete_cookie(name, secure=state.settings.cookie_secure, httponly=True, samesite="lax")

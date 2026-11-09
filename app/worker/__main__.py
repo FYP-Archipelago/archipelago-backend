@@ -43,12 +43,12 @@ def process_next(r: redis.Redis, name: str) -> None:
         # XAUTOCLAIM counts as a delivery, so a job re-claimed once is at 2
         deliveries = r.xpending_range(PENDING_RUNS, GROUP, job_id, job_id, 1)[0]["times_delivered"]
         if deliveries > MAX_DELIVERIES:
-            write_error(r, run_id, "internal", f"failed after {MAX_DELIVERIES} attempts")
+            write_error(r, run_id, "internal", f"Failed after {MAX_DELIVERIES} attempts")
         else:
             log.info("run %s: starting (delivery %d)", run_id, deliveries)
             threading.Thread(target=heartbeat, args=(r, name, job_id, stop), daemon=True).start()
             run_job(r, run_id, fields[JOB_STREAM] == b"true", fields[JOB_CONFIG])
-        # ack last: until then a crash leaves the job pending for another worker to claim
+        # Ack last: until then a crash leaves the job pending for another worker to claim
         r.xack(PENDING_RUNS, GROUP, job_id)
         r.xdel(PENDING_RUNS, job_id)
         log.info("run %s: done", run_id)

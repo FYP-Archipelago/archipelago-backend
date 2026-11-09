@@ -136,8 +136,8 @@ async def list_unexpired(pool: AsyncConnectionPool) -> list[str]:
         return [row["run_id"] for row in await cur.fetchall()]
 
 
-async def get_result_body(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> bytes | None:
+async def get_result_body(pool: AsyncConnectionPool, run_id: str) -> bytes | None:
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT body FROM results JOIN runs USING (run_id) WHERE run_id = %s AND user_id = %s", (run_id, user_id))
+        cur = await conn.execute("SELECT body FROM results WHERE run_id = %s", (run_id,))
         row = await cur.fetchone()
     return bytes(row["body"]) if row else None

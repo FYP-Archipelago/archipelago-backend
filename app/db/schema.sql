@@ -1,8 +1,8 @@
 CREATE TABLE IF NOT EXISTS users (
     id uuid PRIMARY KEY,
-    email text NOT NULL UNIQUE CHECK (email = lower(email)),
+    email text NOT NULL UNIQUE,
     password_hash text NOT NULL,
-    full_name text NOT NULL CHECK (length(btrim(full_name)) > 0),
+    full_name text NOT NULL,
     institution text,
     created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -10,13 +10,13 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS auth_sessions (
     id uuid PRIMARY KEY,
     user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    access_token_hash bytea NOT NULL UNIQUE CHECK (octet_length(access_token_hash) = 32),
-    refresh_token_hash bytea NOT NULL UNIQUE CHECK (octet_length(refresh_token_hash) = 32),
+    access_token_hash bytea NOT NULL UNIQUE,
+    refresh_token_hash bytea NOT NULL UNIQUE,
     csrf_token text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
     access_expires_at timestamptz NOT NULL,
     refresh_expires_at timestamptz NOT NULL,
-    CHECK (access_expires_at > created_at AND access_expires_at <= refresh_expires_at)
+    CHECK (access_expires_at <= refresh_expires_at)
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -40,7 +40,5 @@ CREATE TABLE IF NOT EXISTS results (
     body bytea NOT NULL
 );
 
-
-CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions (user_id);
 CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions (refresh_expires_at);
 CREATE INDEX IF NOT EXISTS runs_owner_history_idx ON runs (user_id, created_at DESC, run_id DESC);

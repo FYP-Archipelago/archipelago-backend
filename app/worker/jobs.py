@@ -46,9 +46,9 @@ def split(entries: list[Entry]) -> Chunk:
             if data.get("type") == "run_end":
                 reason = data.get("termination_reason")
                 if reason == "aborted":
-                    chunk.failure = "run cancelled"
+                    chunk.failure = "Run cancelled"
                 elif reason in ("error", "time_limit"):
-                    chunk.failure = data.get("error") or "runner failed"
+                    chunk.failure = data.get("error") or "Runner failed"
                 else:
                     chunk.ended = True
                 break
@@ -66,7 +66,7 @@ def chunks(r: redis.Redis, run_id: str, after: bytes, last_entry: float | None) 
         response = r.xread({runner_logs_key(run_id): after}, count=READ_COUNT, block=1000)  # ms
         if not response:
             if last_entry is not None and time.monotonic() - last_entry > IDLE_TIMEOUT_SECONDS:
-                raise RunnerFailed(f"no logs for {IDLE_TIMEOUT_SECONDS} s")
+                raise RunnerFailed(f"No logs for {IDLE_TIMEOUT_SECONDS} s")
             continue
         last_entry = time.monotonic()
         chunk = split(response[0][1])
@@ -87,7 +87,7 @@ def write_error(r: redis.Redis, run_id: str, phase: str, message: str) -> None:
 def run_job(r: redis.Redis, run_id: str, stream: bool, config_json: bytes) -> None:
     config = Config.model_validate_json(config_json)
     last = r.xrevrange(clustered_key(run_id), count=1)
-    # a final or error entry means an earlier delivery already finished this job
+    # A final or error entry means an earlier delivery already finished this job
     if last and (FINAL in last[0][1] or ERROR in last[0][1]):
         return
     try:
@@ -107,7 +107,7 @@ def run_streamed(r: redis.Redis, run_id: str, config: Config, covers: bytes | No
     ended = False
     last_entry: float | None = None
     if covers is not None:
-        # crash recovery: rebuild the state from the logs already clustered, in pages of READ_COUNT, writing nothing
+        # Crash recovery: rebuild the state from the logs already clustered, in pages of READ_COUNT, writing nothing
         start: str | bytes = "-"
         while True:
             page = r.xrange(runner_logs_key(run_id), start, covers, count=READ_COUNT)
@@ -125,8 +125,8 @@ def run_streamed(r: redis.Redis, run_id: str, config: Config, covers: bytes | No
             tick = time.monotonic()
             update = cs.cluster(chunk.rows, chunk.events)
             r.xadd(clustered_key(run_id), {COVERS: chunk.last_id, UPDATE: update.model_dump_json()})
-            # at most one cluster() per tick: tiny updates each re-send drifting percentiles and weights, bloating clustered and every SSE replay
-            # a full read means a backlog, and sleeping would cap catching up at READ_COUNT rows per tick
+            # At most one cluster() per tick: tiny updates each re-send drifting percentiles and weights, bloating clustered and every SSE replay
+            # A full read means a backlog, and sleeping would cap catching up at READ_COUNT rows per tick
             if not (chunk.ended or chunk.full):
                 time.sleep(max(0.0, tick + UPDATE_INTERVAL_SECONDS - time.monotonic()))
 
