@@ -12,6 +12,7 @@ from app.db import runs
 from app.ids import mint_run_id
 from app.main import app
 from app.models.runs import CreateRun
+from app.routes import events as events_route
 from tests.conftest import LOGIN, ORIGIN, FakeRunner, cookie_headers, csrf_headers, parse_sse, register
 
 pytestmark = pytest.mark.anyio
@@ -94,16 +95,14 @@ async def test_other_users_runs_are_not_found(browser: httpx.AsyncClient, runner
     assert (await browser.get(f"/runs/{run_id}/result", headers=cookie_headers(owner))).json() == {"graph": {}}
 
 
-async def test_a_live_stream_ends_when_its_session_logs_out(
-    browser: httpx.AsyncClient, sync_redis: redis.Redis, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    owner = await register(browser)
-    run_id = await seed_run(owner)
-    entry = sync_redis.xadd(f"run:{run_id}:clustered", {"update": json.dumps({"n": 1})}).decode()
+# Opens a run's live stream and returns once it has sent `entry` and waits for more, checking the session on every loop.
+async def stream_past(
+    browser: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, owner: httpx.Response, run_id: str, entry: str
+) -> asyncio.Task[httpx.Response]:
+    monkeypatch.setattr(events_route, "SESSION_CHECK_SECONDS", 0)
     waiting = asyncio.Event()
     xread = app.state.redis.xread
 
-    # The stream has sent the update once it waits for entries after it
     async def observe_reads(streams: dict[str, str], *args: Any, **kwargs: Any) -> Any:
         if streams.get(f"run:{run_id}:clustered") == entry:
             waiting.set()
@@ -112,6 +111,17 @@ async def test_a_live_stream_ends_when_its_session_logs_out(
     monkeypatch.setattr(app.state.redis, "xread", observe_reads)
     response = asyncio.create_task(browser.get(f"/runs/{run_id}/events", headers=cookie_headers(owner)))
     await asyncio.wait_for(waiting.wait(), 3)
+    return response
+
+
+async def test_a_live_stream_ends_when_its_session_logs_out(
+    browser: httpx.AsyncClient, sync_redis: redis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = await register(browser)
+    run_id = await seed_run(owner)
+    entry = sync_redis.xadd(f"run:{run_id}:clustered", {"update": json.dumps({"n": 1})}).decode()
+    response = await stream_past(browser, monkeypatch, owner, run_id, entry)
+
     assert (await browser.post("/auth/logout", headers=cookie_headers(owner))).status_code == 204
 
     events = parse_sse((await asyncio.wait_for(response, 5)).text)
@@ -120,3 +130,17 @@ async def test_a_live_stream_ends_when_its_session_logs_out(
         ("update", entry, {"n": 1}),
         ("auth_required", None, {"detail": "Authentication required"}),
     ]
+
+
+async def test_a_live_stream_survives_a_refresh(browser: httpx.AsyncClient, sync_redis: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:
+    owner = await register(browser)
+    run_id = await seed_run(owner)
+    key = f"run:{run_id}:clustered"
+    entry = sync_redis.xadd(key, {"update": json.dumps({"n": 1})}).decode()
+    response = await stream_past(browser, monkeypatch, owner, run_id, entry)
+
+    assert (await browser.post("/auth/refresh", headers=cookie_headers(owner))).status_code == 200
+    final = sync_redis.xadd(key, {"final": json.dumps({"n": 2})}).decode()
+
+    events = parse_sse((await asyncio.wait_for(response, 5)).text)
+    assert events == [("status", None, {"status": "queued"}), ("update", entry, {"n": 1}), ("final", final, {"n": 2})]

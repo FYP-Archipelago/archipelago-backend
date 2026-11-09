@@ -30,7 +30,7 @@ def _decode_cursor(cursor: str) -> tuple[datetime, str]:
         if not isinstance(value, dict) or set(value) != {"created_at", "run_id"}:
             raise ValueError
         created_at = datetime.fromisoformat(value["created_at"])
-        if created_at.tzinfo is None or created_at.utcoffset() != UTC.utcoffset(created_at) or not is_run_id(value["run_id"]):
+        if created_at.utcoffset() != UTC.utcoffset(created_at) or not is_run_id(value["run_id"]):
             raise ValueError
         return created_at, value["run_id"]
     except (ValueError, TypeError, KeyError) as e:

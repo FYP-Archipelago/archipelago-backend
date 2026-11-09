@@ -13,7 +13,6 @@ PasswordDigest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 class Session:
     id: UUID
     user_id: UUID
-    access_token_hash: bytes
     csrf_token: str
     access_expires_at: datetime
     refresh_expires_at: datetime

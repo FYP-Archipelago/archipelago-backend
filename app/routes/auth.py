@@ -1,8 +1,9 @@
+import asyncio
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from app.auth import ACCESS_COOKIE, REFRESH_COOKIE, CurrentSession, hash_token, mint_token, passwords, require_origin
+from app.auth import ACCESS_COOKIE, REFRESH_COOKIE, REFRESH_COOKIE_PATH, CurrentSession, hash_token, mint_token, passwords, require_origin
 from app.db import auth as auth_db
 from app.models.auth import LoginRequest, RegisterRequest, Session, SessionResponse, User
 
@@ -17,8 +18,11 @@ def _body(user: User, session: Session) -> SessionResponse:
 
 def _set_cookies(response: Response, secure: bool, session: Session, access: str, refresh: str) -> None:
     now = datetime.now(UTC)
-    for name, token, expires in ((ACCESS_COOKIE, access, session.access_expires_at), (REFRESH_COOKIE, refresh, session.refresh_expires_at)):
-        response.set_cookie(name, token, max_age=int((expires - now).total_seconds()), secure=secure, httponly=True, samesite="lax")
+    for name, token, expires, path in (
+        (ACCESS_COOKIE, access, session.access_expires_at, "/"),
+        (REFRESH_COOKIE, refresh, session.refresh_expires_at, REFRESH_COOKIE_PATH),
+    ):
+        response.set_cookie(name, token, max_age=int((expires - now).total_seconds()), path=path, secure=secure, httponly=True, samesite="lax")
 
 
 async def _start_session(request: Request, response: Response, user: User) -> SessionResponse:
@@ -35,7 +39,7 @@ async def _start_session(request: Request, response: Response, user: User) -> Se
 
 @router.post("/register", status_code=201, dependencies=[Depends(require_origin)])
 async def register(body: RegisterRequest, request: Request, response: Response) -> SessionResponse:
-    password_hash = passwords.hash(body.password_digest)
+    password_hash = await asyncio.to_thread(passwords.hash, body.password_digest)
     user = await auth_db.create_user(request.app.state.pool, body.email, password_hash, body.full_name, body.institution)
     if user is None:
         raise HTTPException(409, "Email already registered")
@@ -47,7 +51,7 @@ async def login(body: LoginRequest, request: Request, response: Response) -> Ses
     found = await auth_db.get_login(request.app.state.pool, body.email)
     if found is not None:
         user, password_hash = found
-        if passwords.verify(body.password_digest, password_hash):
+        if await asyncio.to_thread(passwords.verify, body.password_digest, password_hash):
             return await _start_session(request, response, user)
     raise HTTPException(401, "Invalid email or password")
 
@@ -75,5 +79,6 @@ async def logout(request: Request, response: Response) -> None:
     token = request.cookies.get(REFRESH_COOKIE)
     if token:
         await auth_db.delete_session(state.pool, hash_token(token))
-    for name in (ACCESS_COOKIE, REFRESH_COOKIE):
-        response.delete_cookie(name, secure=state.settings.cookie_secure, httponly=True, samesite="lax")
+    # A cookie is only deleted by a matching path
+    for name, path in ((ACCESS_COOKIE, "/"), (REFRESH_COOKIE, REFRESH_COOKIE_PATH)):
+        response.delete_cookie(name, path=path, secure=state.settings.cookie_secure, httponly=True, samesite="lax")

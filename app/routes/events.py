@@ -4,7 +4,6 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
-import psycopg
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
@@ -16,7 +15,8 @@ from app.ids import is_run_id
 from app.redis_names import ERROR, FINAL, PHASE, UPDATE, clustered_key
 
 SSE_BLOCK_MS = 2000
-KEEPALIVE_SECONDS = 15
+KEEPALIVE_SECONDS = 15  # Idle stream sends Keep Alive so proxies and browsers don't drop the connection
+SESSION_CHECK_SECONDS = 10  # A logout ends open streams within the limit
 STREAM_ID = re.compile(r"^\d+-\d+$")
 
 router = APIRouter()
@@ -39,21 +39,20 @@ async def run_events(run_id: str, request: Request, session: CurrentSession) -> 
     last_event_id = request.headers.get("last-event-id", "")
     key = clustered_key(run_id)
 
-    async def check_session() -> None:
-        if await auth_db.get_session(state.pool, session.access_token_hash) is None:
-            raise HTTPException(401, "Authentication required")
-
     async def stream() -> AsyncGenerator[bytes]:
         status = run.status
         after = last_event_id if STREAM_ID.fullmatch(last_event_id) else "0-0"
-        last_output = time.monotonic()
+        last_output = last_session_check = time.monotonic()
         yield _sse("status", json.dumps({"status": status}).encode())
         if status == "cancelled":
             return
         while not await request.is_disconnected():
             response = await redis.xread({key: after}, block=SSE_BLOCK_MS)
-            # Checked on every wait as well, so a logout also ends a stream that has nothing to send
-            await check_session()
+            if time.monotonic() - last_session_check >= SESSION_CHECK_SECONDS:
+                if not await auth_db.is_session_active(state.pool, session.id):
+                    yield _sse("auth_required", b'{"detail":"Authentication required"}')
+                    return
+                last_session_check = time.monotonic()
             current = await runs.get_owned_run(state.pool, run_id, session.user_id)
             if current is None:
                 return
@@ -119,13 +118,4 @@ async def run_events(run_id: str, request: Request, session: CurrentSession) -> 
                     yield b": keep-alive\n\n"
                     last_output = time.monotonic()
 
-    # The response has already started, so a lost session can't become a 401 and is sent as an event instead
-    async def authenticated_stream() -> AsyncGenerator[bytes]:
-        try:
-            async for event in stream():
-                await check_session()
-                yield event
-        except (HTTPException, psycopg.Error):
-            yield _sse("auth_required", b'{"detail":"Authentication required"}')
-
-    return StreamingResponse(authenticated_stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no"})

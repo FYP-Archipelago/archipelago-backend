@@ -30,8 +30,8 @@ async def test_register_starts_a_session(browser: httpx.AsyncClient) -> None:
     cookies = SimpleCookie()
     for header in response.headers.get_list("set-cookie"):
         cookies.load(header)
-    for name, lifetime in ((ACCESS_COOKIE, 4 * 3600), (REFRESH_COOKIE, 30 * 24 * 3600)):
-        assert cookies[name]["httponly"] and cookies[name]["samesite"] == "lax"
+    for name, lifetime, path in ((ACCESS_COOKIE, 4 * 3600, "/"), (REFRESH_COOKIE, 30 * 24 * 3600, "/auth")):
+        assert cookies[name]["httponly"] and cookies[name]["samesite"] == "lax" and cookies[name]["path"] == path
         assert lifetime - 5 <= int(cookies[name]["max-age"]) <= lifetime
     me = await browser.get("/auth/me")
     assert me.status_code == 200 and me.json() == body
@@ -84,7 +84,14 @@ async def test_logout_ends_only_this_browsers_session(browser: httpx.AsyncClient
     response = await browser.post("/auth/logout", headers=cookie_headers(first))
 
     assert response.status_code == 204
-    assert {cookie.split("=")[0] for cookie in response.headers.get_list("set-cookie")} == {ACCESS_COOKIE, REFRESH_COOKIE}
+    cleared = SimpleCookie()
+    for header in response.headers.get_list("set-cookie"):
+        cleared.load(header)
+    # A browser only deletes a cookie whose path matches the one it was set with
+    assert {name: (cookie["path"], cookie["max-age"]) for name, cookie in cleared.items()} == {
+        ACCESS_COOKIE: ("/", "0"),
+        REFRESH_COOKIE: ("/auth", "0"),
+    }
     assert (await browser.get("/auth/me", headers=cookie_headers(first))).status_code == 401
     assert (await browser.post("/auth/refresh", headers=cookie_headers(first))).status_code == 401
     assert (await browser.get("/auth/me", headers=cookie_headers(second))).status_code == 200

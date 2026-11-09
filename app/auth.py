@@ -10,6 +10,7 @@ from app.models.auth import Session
 
 ACCESS_COOKIE = "archipelago_access"
 REFRESH_COOKIE = "archipelago_refresh"
+REFRESH_COOKIE_PATH = "/auth"  # Only the auth routes need it
 
 passwords = PasswordHash.recommended()
 

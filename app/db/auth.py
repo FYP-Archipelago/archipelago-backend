@@ -9,7 +9,7 @@ ACCESS_LIFETIME = timedelta(hours=4)
 REFRESH_LIFETIME = timedelta(days=30)  # Time from login
 
 USER_COLUMNS = "id, email, full_name, institution, created_at"
-SESSION_COLUMNS = "id, user_id, access_token_hash, csrf_token, access_expires_at, refresh_expires_at"
+SESSION_COLUMNS = "id, user_id, csrf_token, access_expires_at, refresh_expires_at"
 
 
 async def create_user(pool: AsyncConnectionPool, email: str, password_hash: str, full_name: str, institution: str | None) -> User | None:
@@ -60,6 +60,12 @@ async def get_session(pool: AsyncConnectionPool, access_token_hash: bytes) -> Se
         )
         row = await cur.fetchone()
     return Session(**row) if row else None
+
+
+async def is_session_active(pool: AsyncConnectionPool, session_id: UUID) -> bool:
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT 1 FROM auth_sessions WHERE id = %s AND refresh_expires_at > now()", (session_id,))
+        return await cur.fetchone() is not None
 
 
 # One UPDATE, so two refreshes with the same token can't both succeed: the second waits for the first's row lock, then no longer matches the old hash.

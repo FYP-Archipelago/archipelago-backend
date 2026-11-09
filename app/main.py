@@ -3,7 +3,6 @@ import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 
-import psycopg
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import AsyncConnectionPool
@@ -34,7 +33,7 @@ async def _cleanup_sessions(pool: AsyncConnectionPool) -> None:
     while True:
         try:
             await auth.delete_expired_sessions(pool)
-        except psycopg.Error:
+        except Exception:
             logger.exception("expired session cleanup failed")
         await asyncio.sleep(SESSION_CLEANUP_SECONDS)
 
