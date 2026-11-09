@@ -172,10 +172,35 @@ async def run_result(run_id: str, request: Request) -> Response:
     body = await queries.get_result_body(state.pool, run_id)
     if body is None:
         raise HTTPException(404, f"no result: run {run.status}" if run.status in ("failed", "cancelled") else f"no result: run is {run.status}")
+    result = json.loads(await asyncio.to_thread(gzip.decompress, body))
+    nodes, migrations = result["graph"]["nodes"], result["graph"]["migrations"]
+    islands = sorted(set(result["run"]["islands"]) | set(nodes["island"]))
+    island_of = dict(zip(nodes["id"], nodes["island"]))
+    counts = {a: {b: 0 for b in islands} for a in islands}
+    for source, target, count in zip(migrations["source"], migrations["target"], migrations["count"]):
+        counts[island_of[source]][island_of[target]] += count
+    maximum = max((count for row in counts.values() for count in row.values()), default=0)
+    totals = [{"island": a, "sent": sum(counts[a].values()), "received": sum(counts[b][a] for b in islands)} for a in islands]
+    bar_max = max((max(row["sent"], row["received"]) for row in totals), default=0)
+    result["migration_summary"] = {
+        "islands": islands,
+        "total": sum(row["sent"] for row in totals),
+        "routes": sum(count > 0 for row in counts.values() for count in row.values()),
+        "rows": [
+            {"island": a, "cells": [{"island": b, "count": counts[a][b], "intensity": counts[a][b] / maximum if maximum else 0} for b in islands]}
+            for a in islands
+        ],
+        "totals": [
+            dict(row, sent_percent=100 * row["sent"] / bar_max if bar_max else 0, received_percent=100 * row["received"] / bar_max if bar_max else 0)
+            for row in totals
+        ],
+        "maximum": maximum,
+    }
+    body = json.dumps(result, allow_nan=False).encode()
     headers = {"Vary": "Accept-Encoding"}
     if "gzip" in request.headers.get("accept-encoding", ""):
-        return Response(body, media_type="application/json", headers={**headers, "Content-Encoding": "gzip"})
-    return Response(await asyncio.to_thread(gzip.decompress, body), media_type="application/json", headers=headers)
+        return Response(await asyncio.to_thread(gzip.compress, body), media_type="application/json", headers={**headers, "Content-Encoding": "gzip"})
+    return Response(body, media_type="application/json", headers=headers)
 
 
 @router.get("/health")

@@ -156,8 +156,15 @@ async def test_result_is_404_until_the_run_is_done(api: httpx.AsyncClient, statu
 
 
 @pytest.mark.parametrize(("accept", "encoding"), [("gzip", "gzip"), ("identity", None)])
-async def test_result_is_served_as_stored(api: httpx.AsyncClient, accept: str, encoding: str | None) -> None:
-    final = b'{"graph": {"nodes": [1, 2, 3]}}'
+async def test_result_includes_python_migration_summary(api: httpx.AsyncClient, accept: str, encoding: str | None) -> None:
+    payload = {
+        "run": {"islands": [0, 1, 2]},
+        "graph": {
+            "nodes": {"id": [10, 20, 30], "island": [0, 1, 0]},
+            "migrations": {"source": [10, 30, 20], "target": [20, 20, 10], "count": [3, 4, 2]},
+        },
+    }
+    final = json.dumps(payload).encode()
     await seed_run()
     await queries.save_result(app.state.pool, RUN_ID, gzip.compress(final))
 
@@ -165,7 +172,14 @@ async def test_result_is_served_as_stored(api: httpx.AsyncClient, accept: str, e
 
     assert r.status_code == 200
     assert r.headers.get("content-encoding") == encoding
-    assert r.content == final
+    response = r.json()
+    assert response["graph"] == payload["graph"]
+    assert response["run"] == payload["run"]
+    summary = response["migration_summary"]
+    assert summary["total"] == 9
+    assert summary["routes"] == 2
+    assert summary["rows"][0]["cells"][1]["count"] == 7
+    assert summary["totals"][2]["sent"] == summary["totals"][2]["received"] == 0
 
 
 async def test_events_replay_the_clustered_stream_and_close_after_final(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
