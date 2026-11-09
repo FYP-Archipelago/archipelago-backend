@@ -61,7 +61,7 @@ async def test_batch_run_goes_through_clustering_to_done(api: httpx.AsyncClient,
 
     await wait_for(lambda: streams_expired(run_id))
     assert await status_is(run_id, "done")
-    body = await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID)
+    body = await runs.get_result_body(app.state.pool, run_id)
     assert body is not None and gzip.decompress(body) == final
     assert 0 < sync_redis.ttl(f"run:{run_id}:clustered") <= supervisor.STREAM_TTL_SECONDS
 
@@ -89,12 +89,11 @@ async def test_a_failed_result_save_is_retried_not_lost(
     await wait_for(lambda: streams_expired(run_id))
     assert saves == 2
     assert await status_is(run_id, "done")
-    body = await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID)
+    body = await runs.get_result_body(app.state.pool, run_id)
     assert body is not None and gzip.decompress(body) == b'{"graph": {}}'
 
 
-# The TTL must wait for the runner too: EXPIRE deletes the key, and a later XADD from a runner
-# that is still going would recreate runner_logs with no TTL at all.
+# The TTL must wait for the runner too: EXPIRE deletes the key, and a later XADD from a runner still going would recreate runner_logs with no TTL.
 async def test_streams_expire_only_after_the_runner_stopped(api: httpx.AsyncClient, runner: FakeRunner, sync_redis: redis.Redis) -> None:
     run_id = await create_run(api, stream=True)
 
@@ -139,13 +138,13 @@ async def test_cancelling_batch_waits_for_worker_release_and_discards_its_final(
     with anyio.fail_after(10):
         await waiting.wait()
     assert await status_is(run_id, "cancelling") and not await streams_expired(run_id)
-    assert await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID) is None
+    assert await runs.get_result_body(app.state.pool, run_id) is None
 
     sync_redis.xack("pending_runs", "workers", job_id)
     sync_redis.xdel("pending_runs", job_id)
     await wait_for(lambda: streams_expired(run_id))
     assert await status_is(run_id, "cancelled")
-    assert await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID) is None
+    assert await runs.get_result_body(app.state.pool, run_id) is None
     assert f"POST /runs/{run_id}/cancel" not in runner.calls
 
 
@@ -165,7 +164,7 @@ async def test_cancellation_survives_restart_and_retries_an_unreachable_runner(
         with anyio.fail_after(15):
             while runner.calls.count(f"POST /runs/{run_id}/cancel") < 2:
                 await anyio.sleep(0.1)
-        finish_job(sync_redis, run_id, phase="runner", error="run cancelled")
+        finish_job(sync_redis, run_id, phase="runner", error="Run cancelled")
         with anyio.fail_after(10):
             while runner.calls.count(f"POST /runs/{run_id}/cancel") < 3:
                 await anyio.sleep(0.1)
@@ -206,7 +205,7 @@ async def test_stopped_run_with_lost_terminal_entry_is_cleaned_after_restart(
     async with running_app():
         await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
         if status == "failed":
-            await runs.set_failed(app.state.pool, run_id, "runner", "runner failed")
+            await runs.set_failed(app.state.pool, run_id, "runner", "Runner failed")
         else:
             await runs.set_cancelling(app.state.pool, run_id)
         sync_redis.xadd("pending_runs", {"run_id": run_id, "stream": "false", "config": "{}"})
@@ -231,7 +230,7 @@ async def test_pending_job_prevents_early_cleanup_until_worker_finishes(
 
     async with running_app():
         await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
-        await runs.set_failed(app.state.pool, run_id, "runner", "runner failed")
+        await runs.set_failed(app.state.pool, run_id, "runner", "Runner failed")
         sync_redis.xadd("pending_runs", {"run_id": run_id, "stream": "false", "config": "{}"})
         if claimed:
             sync_redis.xreadgroup("workers", "worker-1", {"pending_runs": ">"}, count=1)
@@ -242,7 +241,7 @@ async def test_pending_job_prevents_early_cleanup_until_worker_finishes(
         [(_, abort)] = sync_redis.xrange(f"run:{run_id}:runner_logs")
         assert abort[b"kind"] == b"abort"
 
-        finish_job(sync_redis, run_id, phase="runner", error="runner failed")
+        finish_job(sync_redis, run_id, phase="runner", error="Runner failed")
         await wait_for(lambda: streams_expired(run_id))
 
 
@@ -277,7 +276,7 @@ async def test_runner_failure_aborts_the_job_with_its_reason(api: httpx.AsyncCli
 
 @pytest.mark.parametrize(
     ("status", "message"),
-    [(httpx.Response(404), "runner has no record of this run"), (httpx.ConnectError("refused"), "runner unreachable")],
+    [(httpx.Response(404), "Runner has no record of this run"), (httpx.ConnectError("refused"), "Runner unreachable")],
 )
 async def test_vanished_or_unreachable_runner_fails_the_run(
     api: httpx.AsyncClient, runner: FakeRunner, monkeypatch: pytest.MonkeyPatch, status: httpx.Response | Exception, message: str

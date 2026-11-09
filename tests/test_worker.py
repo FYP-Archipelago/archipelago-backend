@@ -15,7 +15,7 @@ CONFIG = Config(lsh=True, birch=True, denstream=True)
 CLUSTERED = f"run:{SYNTHETIC_RUN_ID}:clustered"
 
 
-# the synthetic run is short, so let streamed runs go live early and produce real updates
+# The synthetic run is short, so let streamed runs go live early and produce real updates
 @pytest.fixture(autouse=True)
 def short_warm_up(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("archipelago.stream.WARMUP_ROWS", 50)
@@ -65,8 +65,8 @@ def test_streamed_backlog_matches_the_module_without_sleeping(
     assert without_elapsed(entries[-1][b"final"]) == without_elapsed(reference.finish().model_dump_json())
 
 
-# A worker that crashed after its update covering entry N must, on re-claim, rebuild its state
-# from the logs up to N without writing anything, then carry on and reach the same final result.
+# A worker that crashed after its update covering entry N must, on re-claim, rebuild its state from the logs up to N without writing anything.
+# It must then carry on and reach the same final result.
 # Paged recovery must give the same result as one read, also when covers lands on a page boundary.
 @pytest.mark.parametrize("covered_at", [225, 199])
 def test_streamed_job_recovers_from_its_last_update(
@@ -118,13 +118,13 @@ def test_finished_job_is_not_redone(sync_redis: redis.Redis, log_entries: list[d
     [
         (entry("abort", {"error": "runner unreachable"}, "3-0"), "runner unreachable", False),
         (entry("event", {"type": "run_end", "termination_reason": "error", "error": "island 3 crashed"}, "3-0"), "island 3 crashed", False),
-        (entry("event", {"type": "run_end", "termination_reason": "error"}, "3-0"), "runner failed", False),
+        (entry("event", {"type": "run_end", "termination_reason": "error"}, "3-0"), "Runner failed", False),
         (
             entry("event", {"type": "run_end", "termination_reason": "time_limit", "error": "time limit of 3600 s"}, "3-0"),
             "time limit of 3600 s",
             False,
         ),
-        (entry("event", {"type": "run_end", "termination_reason": "aborted"}, "3-0"), "run cancelled", False),
+        (entry("event", {"type": "run_end", "termination_reason": "aborted"}, "3-0"), "Run cancelled", False),
         (entry("event", {"type": "run_end", "termination_reason": "completed"}, "3-0"), None, True),
     ],
 )
@@ -154,7 +154,7 @@ def test_job_fails_when_logs_stop(sync_redis: redis.Redis, log_entries: list[dic
 
     jobs.run_job(sync_redis, SYNTHETIC_RUN_ID, False, CONFIG.model_dump_json().encode())
 
-    assert clustered(sync_redis) == [{b"phase": b"runner", b"error": b"no logs for 1 s"}]
+    assert clustered(sync_redis) == [{b"phase": b"runner", b"error": b"No logs for 1 s"}]
 
 
 def test_clustering_error_is_reported_not_raised(sync_redis: redis.Redis, log_entries: list[dict[str, Any]]) -> None:
@@ -219,13 +219,12 @@ def test_job_over_the_delivery_limit_gives_up(sync_redis: redis.Redis, monkeypat
 
     worker_main.process_next(sync_redis, "w2")
 
-    assert clustered(sync_redis) == [{b"phase": b"internal", b"error": b"failed after 3 attempts"}]
+    assert clustered(sync_redis) == [{b"phase": b"internal", b"error": b"Failed after 3 attempts"}]
     assert sync_redis.xlen("pending_runs") == 0
     assert sync_redis.xpending("pending_runs", "workers")["pending"] == 0
 
 
-# A plain XCLAIM adds a delivery on every beat, which would make a crashed job look like it had
-# already failed 3 times and skip recovery.
+# A plain XCLAIM adds a delivery on every beat, which would make a crashed job look like it had already failed 3 times and skip recovery.
 def test_heartbeat_keeps_the_delivery_count_at_one(sync_redis: redis.Redis, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker_main, "HEARTBEAT_SECONDS", 0.05)
     sync_redis.xgroup_create("pending_runs", "workers", id="0", mkstream=True)

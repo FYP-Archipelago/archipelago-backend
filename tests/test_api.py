@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import gzip
 import json
 from typing import Any
@@ -15,21 +16,12 @@ from app import runner as runner_client
 from app.db import runs
 from app.main import app
 from app.models.runs import CreateRun, RunStatus
-from tests.conftest import TEST_USER_ID, FakeRunner
+from tests.conftest import TEST_USER_ID, FakeRunner, parse_sse
 
 pytestmark = pytest.mark.anyio
 
 BODY: dict[str, Any] = {"preset": "de-rastrigin", "overrides": {"num_islands": 4}, "stream": True, "clustering": {"lsh": True}}
 RUN_ID = "run-20261027T000000Z-0123abcd"
-
-
-def parse_sse(text: str) -> list[tuple[str, str | None, Any]]:
-    events = []
-    for block in text.strip().split("\n\n"):
-        lines = dict(line.split(": ", 1) for line in block.splitlines() if not line.startswith(":"))
-        if lines:
-            events.append((lines["event"], lines.get("id"), json.loads(lines["data"])))
-    return events
 
 
 async def seed_run(status: str = "queued", stream: bool = True) -> None:
@@ -99,6 +91,49 @@ async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClien
     assert runner.calls == []
     empty = await api.get("/runs", params={"preset": "removed-preset"})
     assert empty.json() == {"runs": [], "next_cursor": None}
+
+
+def cursor(value: object) -> str:
+    return base64.urlsafe_b64encode(json.dumps(value).encode()).decode()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"cursor": "not base64!"},
+        {"cursor": cursor(["2026-10-27T00:00:00+00:00", RUN_ID])},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00+00:00"})},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00", "run_id": RUN_ID})},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00+05:30", "run_id": RUN_ID})},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00+00:00", "run_id": "run-1"})},
+    ],
+)
+async def test_malformed_history_cursors_are_422(api: httpx.AsyncClient, params: dict[str, str]) -> None:
+    r = await api.get("/runs", params=params)
+
+    assert r.status_code == 422 and r.json() == {"detail": "Invalid cursor"}
+
+
+async def test_unknown_history_status_is_422(api: httpx.AsyncClient) -> None:
+    assert (await api.get("/runs", params={"status": "finished"})).status_code == 422
+
+
+# Users' runs and results must never sit in a browser's disk cache, where they stay readable after logout.
+async def test_every_kind_of_response_is_marked_no_store(api: httpx.AsyncClient) -> None:
+    await seed_run()
+    await runs.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
+
+    responses = [
+        await api.get("/runs"),
+        await api.get(f"/runs/{RUN_ID}/result"),
+        await api.get(f"/runs/{RUN_ID}/events"),
+        await api.get("/runs/not-a-run"),
+        await api.get("/runs", headers={"Cookie": ""}),
+        await api.get("/health"),
+    ]
+
+    assert [r.status_code for r in responses] == [200, 200, 200, 404, 401, 200]
+    assert all(r.headers["cache-control"] == "no-store" for r in responses)
 
 
 async def test_run_lookup_returns_the_same_metadata_as_history(api: httpx.AsyncClient, runner: FakeRunner) -> None:
@@ -201,11 +236,11 @@ async def test_malformed_and_unknown_runs_are_404(api: httpx.AsyncClient, path: 
     r = await api.get(path)
 
     assert r.status_code == 404
-    assert r.json() == {"detail": "run not found"}
+    assert r.json() == {"detail": "Run not found"}
 
 
 @pytest.mark.parametrize(
-    ("status", "detail"), [("running", "no result: run is running"), ("failed", "no result: run failed"), ("cancelled", "no result: run cancelled")]
+    ("status", "detail"), [("running", "No result: run is running"), ("failed", "No result: run failed"), ("cancelled", "No result: run cancelled")]
 )
 async def test_result_is_404_until_the_run_is_done(api: httpx.AsyncClient, status: str, detail: str) -> None:
     await seed_run(status)
@@ -275,7 +310,7 @@ async def test_cancel_of_a_malformed_or_unknown_run_is_404(api: httpx.AsyncClien
     r = await api.post(path)
 
     assert r.status_code == 404
-    assert r.json() == {"detail": "run not found"}
+    assert r.json() == {"detail": "Run not found"}
     assert runner.calls == []
 
 
@@ -326,7 +361,7 @@ async def test_cancel_that_loses_to_the_result_returns_the_done_run(api: httpx.A
 async def test_events_of_a_cancelled_run_end_with_the_status_only(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
     await seed_run("cancelled")
     sync_redis.xadd(f"run:{RUN_ID}:clustered", {"update": '{"n": 1}'})
-    sync_redis.xadd(f"run:{RUN_ID}:clustered", {"phase": "runner", "error": "run cancelled"})
+    sync_redis.xadd(f"run:{RUN_ID}:clustered", {"phase": "runner", "error": "Run cancelled"})
     sync_redis.xadd(f"run:{RUN_ID}:clustered", {"final": '{"n": 3}'})
 
     events = parse_sse((await api.get(f"/runs/{RUN_ID}/events")).text)
@@ -353,7 +388,7 @@ async def test_events_wait_for_cancellation_and_ignore_late_worker_messages(
     try:
         await asyncio.wait_for(started.wait(), 3)
         await runs.set_cancelling(app.state.pool, RUN_ID)
-        for fields in ({"update": '{"n": 1}'}, {"phase": "runner", "error": "run cancelled"}, {"final": '{"n": 3}'}):
+        for fields in ({"update": '{"n": 1}'}, {"phase": "runner", "error": "Run cancelled"}, {"final": '{"n": 3}'}):
             last_id = sync_redis.xadd(f"run:{RUN_ID}:clustered", fields).decode()
         await asyncio.wait_for(waiting.wait(), 3)
         assert not response.done()
@@ -377,7 +412,7 @@ async def test_statuses_only_move_forward(api: httpx.AsyncClient) -> None:
 
     run = await runs.get_run(app.state.pool, RUN_ID)
     assert run is not None and run.status == "failed"
-    assert await runs.get_result_body(app.state.pool, RUN_ID, TEST_USER_ID) is None
+    assert await runs.get_result_body(app.state.pool, RUN_ID) is None
 
 
 async def test_health(api: httpx.AsyncClient) -> None:
