@@ -6,11 +6,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from archipelago import Result
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from redis.asyncio import Redis
 
 from app import runner
 from app.db import runs
+from app.dependencies import CsrfSession, CurrentSession, require_session
 from app.ids import is_run_id, mint_run_id
 from app.models.runs import CreateRun, RunPage, RunStatus, Status
 from app.redis_names import JOB_CONFIG, JOB_RUN_ID, JOB_STREAM, PENDING_RUNS
@@ -41,7 +42,7 @@ def _encode_cursor(run: RunStatus) -> str:
     return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
 
 
-@router.get("/presets")
+@router.get("/presets", dependencies=[Depends(require_session)])
 async def get_presets(request: Request) -> Response:
     try:
         body = await runner.presets(request.app.state.runner)
@@ -51,10 +52,10 @@ async def get_presets(request: Request) -> Response:
 
 
 @router.post("/runs", status_code=202)
-async def create_run(body: CreateRun, request: Request) -> RunStatus:
+async def create_run(body: CreateRun, request: Request, current: CsrfSession) -> RunStatus:
     state: Any = request.app.state
     redis: Redis = state.redis
-    run = await runs.insert_run(state.pool, mint_run_id(), body)
+    run = await runs.insert_run(state.pool, mint_run_id(), current[0].id, body)
     # enqueue before starting the runner: if the API dies in between, what's left is a waiting job
     # that recovery cleans up, not an EA running with logs that never expire
     await redis.xadd(
@@ -85,48 +86,43 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
 @router.get("/runs", response_model=RunPage)
 async def list_runs(
     request: Request,
+    current: CurrentSession,
     status: Status | None = None,
     preset: str | None = None,
     cursor: str | None = None,
 ) -> RunPage:
     before = _decode_cursor(cursor) if cursor is not None else None
-    rows = await runs.list_runs(request.app.state.pool, RUNS_PAGE_SIZE + 1, status, preset, before)
+    rows = await runs.list_runs(request.app.state.pool, current[0].id, RUNS_PAGE_SIZE + 1, status, preset, before)
     more = len(rows) > RUNS_PAGE_SIZE
     page = rows[:RUNS_PAGE_SIZE]
     return RunPage(runs=page, next_cursor=_encode_cursor(page[-1]) if more else None)
 
 
 @router.get("/runs/{run_id}", response_model=RunStatus)
-async def get_run(run_id: str, request: Request) -> RunStatus:
-    run = await runs.get_run(request.app.state.pool, run_id) if is_run_id(run_id) else None
+async def get_run(run_id: str, request: Request, current: CurrentSession) -> RunStatus:
+    run = await runs.get_owned_run(request.app.state.pool, run_id, current[0].id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
     return run
 
 
 @router.post("/runs/{run_id}/cancel", responses={202: {"model": RunStatus}})
-async def cancel_run(run_id: str, request: Request, response: Response) -> RunStatus:
-    state: Any = request.app.state
-    run = await runs.get_run(state.pool, run_id) if is_run_id(run_id) else None
+async def cancel_run(run_id: str, request: Request, response: Response, current: CsrfSession) -> RunStatus:
+    run = await runs.request_run_cancellation(request.app.state.pool, run_id, current[0].id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
-    if run.status in ("done", "failed", "cancelled"):
-        return run
-    if run.status != "cancelling":
-        await runs.set_cancelling(state.pool, run_id)
-    updated = await runs.get_run(state.pool, run_id) or run
-    if updated.status == "cancelling":
+    if run.status == "cancelling":
         response.status_code = 202
-    return updated
+    return run
 
 
 @router.get("/runs/{run_id}/result", responses={200: {"model": Result}})
-async def run_result(run_id: str, request: Request) -> Response:
+async def run_result(run_id: str, request: Request, current: CurrentSession) -> Response:
     state: Any = request.app.state
-    run = await runs.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    run = await runs.get_owned_run(state.pool, run_id, current[0].id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
-    body = await runs.get_result_body(state.pool, run_id)
+    body = await runs.get_result_body(state.pool, run_id, current[0].id)
     if body is None:
         raise HTTPException(404, f"no result: run {run.status}" if run.status in ("failed", "cancelled") else f"no result: run is {run.status}")
     headers = {"Vary": "Accept-Encoding"}

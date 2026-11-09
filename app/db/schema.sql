@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 
 CREATE TABLE IF NOT EXISTS runs (
     run_id text PRIMARY KEY,
+    user_id uuid NOT NULL REFERENCES users(id),
     status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'clustering', 'done', 'failed', 'cancelling', 'cancelled')),
     stream boolean NOT NULL,
     preset text NOT NULL,
@@ -42,4 +43,4 @@ CREATE TABLE IF NOT EXISTS results (
 
 CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions (user_id);
 CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions (refresh_expires_at);
-CREATE INDEX IF NOT EXISTS runs_history_order_idx ON runs (created_at DESC, run_id DESC);
+CREATE INDEX IF NOT EXISTS runs_owner_history_idx ON runs (user_id, created_at DESC, run_id DESC);

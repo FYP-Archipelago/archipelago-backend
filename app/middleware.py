@@ -11,7 +11,13 @@ class AuthRequestMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not (scope["path"] == "/auth" or scope["path"].startswith("/auth/")):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope["path"]
+        is_auth = path == "/auth" or path.startswith("/auth/")
+        is_run_related = path in ("/presets", "/runs") or path.startswith("/runs/")
+        if not (is_auth or is_run_related):
             await self.app(scope, receive, send)
             return
 
@@ -21,7 +27,7 @@ class AuthRequestMiddleware:
             await send(message)
 
         try:
-            if scope["method"] == "POST":
+            if is_auth and scope["method"] == "POST":
                 require_origin(Request(scope, receive))
             await self.app(scope, receive, no_store)
         except HTTPException as error:

@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
@@ -25,11 +26,11 @@ def _to_run_status(row: dict[str, Any]) -> RunStatus:
     )
 
 
-async def insert_run(pool: AsyncConnectionPool, run_id: str, body: CreateRun) -> RunStatus:
+async def insert_run(pool: AsyncConnectionPool, run_id: str, user_id: UUID, body: CreateRun) -> RunStatus:
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO runs (run_id, stream, preset, overrides, clustering) VALUES (%s, %s, %s, %s, %s) RETURNING *",
-            (run_id, body.stream, body.preset, Jsonb(body.overrides), Jsonb(body.clustering.model_dump(mode="json"))),
+            "INSERT INTO runs (run_id, user_id, stream, preset, overrides, clustering) VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+            (run_id, user_id, body.stream, body.preset, Jsonb(body.overrides), Jsonb(body.clustering.model_dump(mode="json"))),
         )
         row = await cur.fetchone()
     assert row is not None
@@ -43,11 +44,18 @@ async def get_run(pool: AsyncConnectionPool, run_id: str) -> RunStatus | None:
     return _to_run_status(row) if row else None
 
 
+async def get_owned_run(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> RunStatus | None:
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM runs WHERE run_id = %s AND user_id = %s", (run_id, user_id))
+        row = await cur.fetchone()
+    return _to_run_status(row) if row else None
+
+
 async def list_runs(
-    pool: AsyncConnectionPool, limit: int, status: Status | None, preset: str | None, before: tuple[datetime, str] | None
+    pool: AsyncConnectionPool, user_id: UUID, limit: int, status: Status | None, preset: str | None, before: tuple[datetime, str] | None
 ) -> list[RunStatus]:
-    conditions = []
-    values: list[Any] = []
+    conditions = ["user_id = %s"]
+    values: list[Any] = [user_id]
     if status is not None:
         conditions.append("status = %s")
         values.append(status)
@@ -57,7 +65,7 @@ async def list_runs(
     if before is not None:
         conditions.append("(created_at, run_id) < (%s, %s)")
         values.extend(before)
-    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    where = " WHERE " + " AND ".join(conditions)
     async with pool.connection() as conn:
         cur = await conn.execute(
             f"SELECT * FROM runs{where} ORDER BY created_at DESC, run_id DESC LIMIT %s",
@@ -91,6 +99,17 @@ async def set_cancelling(pool: AsyncConnectionPool, run_id: str) -> None:
         )
 
 
+async def request_run_cancellation(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> RunStatus | None:
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE runs SET status = 'cancelling', updated_at = now() WHERE run_id = %s AND user_id = %s AND status = ANY(%s)",
+            (run_id, user_id, PROGRESS_STATUSES),
+        )
+        cur = await conn.execute("SELECT * FROM runs WHERE run_id = %s AND user_id = %s", (run_id, user_id))
+        row = await cur.fetchone()
+    return _to_run_status(row) if row else None
+
+
 async def save_result(pool: AsyncConnectionPool, run_id: str, body: bytes) -> None:
     async with pool.connection() as conn, conn.transaction():
         cur = await conn.execute(
@@ -117,8 +136,8 @@ async def list_unexpired(pool: AsyncConnectionPool) -> list[str]:
         return [row["run_id"] for row in await cur.fetchall()]
 
 
-async def get_result_body(pool: AsyncConnectionPool, run_id: str) -> bytes | None:
+async def get_result_body(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> bytes | None:
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT body FROM results WHERE run_id = %s", (run_id,))
+        cur = await conn.execute("SELECT body FROM results JOIN runs USING (run_id) WHERE run_id = %s AND user_id = %s", (run_id, user_id))
         row = await cur.fetchone()
     return bytes(row["body"]) if row else None

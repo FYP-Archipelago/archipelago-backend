@@ -2,13 +2,16 @@ import json
 import re
 import time
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 
+import psycopg
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from redis.asyncio import Redis
 
-from app.db import runs
+from app.db import auth, runs
+from app.dependencies import CurrentSession
 from app.ids import is_run_id
 from app.redis_names import ERROR, FINAL, PHASE, UPDATE, clustered_key
 
@@ -27,14 +30,21 @@ def _sse(event: str, data: bytes, event_id: bytes | None = None) -> bytes:
 
 
 @router.get("/runs/{run_id}/events")
-async def run_events(run_id: str, request: Request) -> StreamingResponse:
+async def run_events(run_id: str, request: Request, current: CurrentSession) -> StreamingResponse:
     state: Any = request.app.state
     redis: Redis = state.redis
-    run = await runs.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    user, session = current
+    run = await runs.get_owned_run(state.pool, run_id, user.id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
     last_event_id = request.headers.get("last-event-id", "")
     key = clustered_key(run_id)
+
+    async def check_session() -> None:
+        async with state.pool.connection() as conn:
+            active = await auth.get_session_by_access_hash(conn, session.access_token_hash, datetime.now(UTC))
+        if active is None:
+            raise HTTPException(401, "Authentication required")
 
     async def stream() -> AsyncGenerator[bytes]:
         status = run.status
@@ -45,7 +55,9 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
             return
         while not await request.is_disconnected():
             response = await redis.xread({key: after}, block=SSE_BLOCK_MS)
-            current = await runs.get_run(state.pool, run_id)
+            # Checking idle streams after each Redis wait, even when there is no event to emit.
+            await check_session()
+            current = await runs.get_owned_run(state.pool, run_id, user.id)
             if current is None:
                 return
             if current.status in ("cancelling", "cancelled"):
@@ -70,9 +82,11 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                     if UPDATE in fields:
                         yield _sse("update", fields[UPDATE], entry_id)
                     elif FINAL in fields or (PHASE in fields and ERROR in fields):
-                        current = await runs.get_run(state.pool, run_id)
+                        current = await runs.get_owned_run(state.pool, run_id, user.id)
+                        if current is None:
+                            return
                         # Cancellation acknowledgements and late results do not end an unfinished cancellation.
-                        if current is not None and current.status in ("cancelling", "cancelled"):
+                        if current.status in ("cancelling", "cancelled"):
                             if current.status != status:
                                 status = current.status
                                 yield _sse("status", json.dumps({"status": status}).encode())
@@ -83,13 +97,13 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                             yield _sse("error", json.dumps({"phase": fields[PHASE].decode(), "message": fields[ERROR].decode()}).encode())
                             return
                         # a run the backend already failed has no result, so /result would answer 404
-                        if current is not None and current.error is not None:
+                        if current.error is not None:
                             yield _sse("error", current.error.model_dump_json().encode())
                             return
                         yield _sse("final", fields[FINAL], entry_id)
                         return
 
-            current = await runs.get_run(state.pool, run_id)
+            current = await runs.get_owned_run(state.pool, run_id, user.id)
             if current is None:
                 return
             if response or current.status != status:
@@ -108,4 +122,12 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                     yield b": keep-alive\n\n"
                     last_output = time.monotonic()
 
-    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    async def authenticated_stream() -> AsyncGenerator[bytes]:
+        try:
+            async for event in stream():
+                await check_session()
+                yield event
+        except (HTTPException, psycopg.Error):
+            yield _sse("auth_required", b'{"detail":"Authentication required"}')
+
+    return StreamingResponse(authenticated_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})

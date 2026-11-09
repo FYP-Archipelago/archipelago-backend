@@ -40,3 +40,6 @@ async def require_csrf(request: Request, current: CurrentSession) -> tuple[User,
     if len(tokens) != 1 or not secrets.compare_digest(tokens[0].encode(), current[1].csrf_token.encode()):
         raise HTTPException(403, "Invalid CSRF token")
     return current
+
+
+CsrfSession = Annotated[tuple[User, Session], Depends(require_csrf)]
