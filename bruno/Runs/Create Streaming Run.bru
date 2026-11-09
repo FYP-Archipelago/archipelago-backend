@@ -1,7 +1,7 @@
 meta {
-  name: Create Batch Run
+  name: Create Streaming Run
   type: http
-  seq: 4
+  seq: 3
 }
 
 post {
@@ -11,6 +11,8 @@ post {
 }
 
 headers {
+  Origin: {{origin}}
+  X-CSRF-Token: {{csrf_token}}
   Accept: application/json
   Content-Type: application/json
 }
@@ -25,7 +27,7 @@ body:json {
       "migration.enabled": false,
       "seed": 7
     },
-    "stream": false,
+    "stream": true,
     "clustering": {"lsh": true, "birch": true, "denstream": true, "seed": 7}
   }
 }

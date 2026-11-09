@@ -1,0 +1,21 @@
+meta {
+  name: Refresh Session
+  type: http
+  seq: 15
+}
+
+post {
+  url: {{base_url}}/auth/refresh
+  body: json
+  auth: none
+}
+
+headers {
+  Accept: application/json
+  Content-Type: application/json
+  Origin: {{origin}}
+}
+
+body:json {
+  {}
+}

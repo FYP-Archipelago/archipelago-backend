@@ -12,6 +12,7 @@ get {
 
 headers {
   Accept: text/event-stream
+  ~Last-Event-ID: {{last_event_id}}
 }
 
 script:pre-request {
