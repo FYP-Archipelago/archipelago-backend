@@ -1,0 +1,11 @@
+variables:
+  - name: base_url
+    value: http://localhost:8000
+  - name: origin
+    value: http://localhost:5173
+  - name: run_id
+    value: ""
+  - name: next_cursor
+    value: ""
+  - name: last_event_id
+    value: ""

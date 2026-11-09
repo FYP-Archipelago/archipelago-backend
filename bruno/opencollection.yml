@@ -1,0 +1,32 @@
+opencollection: 1.0.0
+
+info:
+  name: Archipelago Backend
+
+request:
+  scripts:
+    - type: after-response
+      code: |-
+        const name = req.getName();
+        if (["Register User", "Login", "Current User", "Refresh Session"].includes(name) && [200, 201].includes(res.getStatus())) {
+          const session = res.getBody();
+          for (const key of ["csrf_token", "access_expires_at", "refresh_expires_at"]) {
+            bru.setVar(key, session[key]);
+          }
+          if (name === "Register User" || name === "Login") {
+            for (const key of ["run_id", "next_cursor", "last_event_id"]) {
+              bru.setVar(key, "");
+            }
+          }
+        }
+        if (name === "Logout" && res.getStatus() === 204) {
+          for (const key of ["csrf_token", "access_expires_at", "refresh_expires_at", "run_id", "next_cursor", "last_event_id"]) {
+            bru.setVar(key, "");
+          }
+        }
+bundled: false
+extensions:
+  bruno:
+    ignore:
+      - node_modules
+      - .git

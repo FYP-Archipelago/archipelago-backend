@@ -1,0 +1,43 @@
+info:
+  name: List Runs
+  type: http
+  seq: 8
+
+http:
+  method: GET
+  url: "{{base_url}}/runs"
+  headers:
+    - name: Accept
+      value: application/json
+  params:
+    - name: status
+      value: done
+      type: query
+      disabled: true
+    - name: preset
+      value: es_schwefel
+      type: query
+      disabled: true
+    - name: cursor
+      value: "{{next_cursor}}"
+      type: query
+      disabled: true
+
+runtime:
+  scripts:
+    - type: after-response
+      code: |-
+        if (res.getStatus() === 200) {
+          const cursor = res.getBody().next_cursor;
+          bru.setVar("next_cursor", cursor || "");
+          if (!cursor) {
+            console.log("Last page reached. Uncheck cursor to start again.");
+          }
+        }
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: true
