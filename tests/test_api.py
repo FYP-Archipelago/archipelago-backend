@@ -2,18 +2,20 @@ import asyncio
 import gzip
 import json
 from typing import Any
+from uuid import UUID
 
 import httpx
 import psycopg
 import pytest
 import redis
 from archipelago import Config
+from psycopg_pool import AsyncConnectionPool
 
 from app import runner as runner_client
 from app.db import runs
 from app.main import app
-from app.models.runs import CreateRun
-from tests.conftest import FakeRunner
+from app.models.runs import CreateRun, RunStatus
+from tests.conftest import TEST_USER_ID, FakeRunner
 
 pytestmark = pytest.mark.anyio
 
@@ -31,7 +33,7 @@ def parse_sse(text: str) -> list[tuple[str, str | None, Any]]:
 
 
 async def seed_run(status: str = "queued", stream: bool = True) -> None:
-    await runs.insert_run(app.state.pool, RUN_ID, CreateRun.model_validate({**BODY, "stream": stream}))
+    await runs.insert_run(app.state.pool, RUN_ID, TEST_USER_ID, CreateRun.model_validate({**BODY, "stream": stream}))
     if status == "failed":
         await runs.set_failed(app.state.pool, RUN_ID, "clustering", "boom")
     elif status in ("cancelling", "cancelled"):
@@ -62,7 +64,7 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
 async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:
     ids = [f"run-20261027T000000Z-{value:08x}" for value in range(1, 42)]
     for run_id in ids:
-        await runs.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
     async with app.state.pool.connection() as conn:
         await conn.execute("UPDATE runs SET created_at = '2026-10-27T00:00:00Z'")
     expected = ids[::-1]
@@ -73,7 +75,7 @@ async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: http
     assert (await api.get("/runs", params={"limit": 1})).json() == first.json()
     cursor = first.json()["next_cursor"]
     assert (await api.get("/runs", params={"cursor": cursor + "!!!!"})).status_code == 422
-    await runs.insert_run(app.state.pool, "run-20261027T000000Z-0000002a", CreateRun.model_validate(BODY))
+    await runs.insert_run(app.state.pool, "run-20261027T000000Z-0000002a", TEST_USER_ID, CreateRun.model_validate(BODY))
 
     second = await api.get("/runs", params={"cursor": cursor})
     assert [run["run_id"] for run in second.json()["runs"]] == expected[20:40]
@@ -84,8 +86,8 @@ async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: http
 
 async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClient, runner: FakeRunner) -> None:
     await seed_run("failed")
-    await runs.insert_run(app.state.pool, "run-20261027T000000Z-00000001", CreateRun.model_validate({**BODY, "preset": "other"}))
-    await runs.insert_run(app.state.pool, "run-20261027T000000Z-00000002", CreateRun.model_validate(BODY))
+    await runs.insert_run(app.state.pool, "run-20261027T000000Z-00000001", TEST_USER_ID, CreateRun.model_validate({**BODY, "preset": "other"}))
+    await runs.insert_run(app.state.pool, "run-20261027T000000Z-00000002", TEST_USER_ID, CreateRun.model_validate(BODY))
     await runs.advance_status(app.state.pool, "run-20261027T000000Z-00000002", "running")
     response = await api.get("/runs", params={"status": "failed", "preset": "de-rastrigin"})
     assert response.status_code == 200
@@ -307,13 +309,13 @@ async def test_cancel_records_the_request_without_waiting_for_the_runner(api: ht
 # A result saved before the cancellation request wins the state transition.
 async def test_cancel_that_loses_to_the_result_returns_the_done_run(api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
     await seed_run("running")
-    set_cancelling = runs.set_cancelling
+    request_run_cancellation = runs.request_run_cancellation
 
-    async def result_saved_first(pool: object, run_id: str) -> None:
-        await runs.save_result(app.state.pool, run_id, b"result")
-        await set_cancelling(app.state.pool, run_id)
+    async def result_saved_first(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> RunStatus | None:
+        await runs.save_result(pool, run_id, b"result")
+        return await request_run_cancellation(pool, run_id, user_id)
 
-    monkeypatch.setattr(runs, "set_cancelling", result_saved_first)
+    monkeypatch.setattr(runs, "request_run_cancellation", result_saved_first)
 
     response = await api.post(f"/runs/{RUN_ID}/cancel")
 
@@ -375,7 +377,7 @@ async def test_statuses_only_move_forward(api: httpx.AsyncClient) -> None:
 
     run = await runs.get_run(app.state.pool, RUN_ID)
     assert run is not None and run.status == "failed"
-    assert await runs.get_result_body(app.state.pool, RUN_ID) is None
+    assert await runs.get_result_body(app.state.pool, RUN_ID, TEST_USER_ID) is None
 
 
 async def test_health(api: httpx.AsyncClient) -> None:

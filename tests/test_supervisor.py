@@ -13,9 +13,9 @@ from app import supervisor
 from app.db import runs
 from app.main import app
 from app.models.runs import CreateRun
-from tests.conftest import FakeRunner
+from tests.conftest import AUTH_HEADERS, TEST_USER_ID, FakeRunner
 
-pytestmark = pytest.mark.anyio
+pytestmark = [pytest.mark.anyio, pytest.mark.usefixtures("run_user")]
 
 BODY: dict[str, Any] = {"preset": "de-rastrigin", "overrides": {}, "stream": False, "clustering": {"lsh": True}}
 
@@ -61,7 +61,7 @@ async def test_batch_run_goes_through_clustering_to_done(api: httpx.AsyncClient,
 
     await wait_for(lambda: streams_expired(run_id))
     assert await status_is(run_id, "done")
-    body = await runs.get_result_body(app.state.pool, run_id)
+    body = await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID)
     assert body is not None and gzip.decompress(body) == final
     assert 0 < sync_redis.ttl(f"run:{run_id}:clustered") <= supervisor.STREAM_TTL_SECONDS
 
@@ -89,7 +89,7 @@ async def test_a_failed_result_save_is_retried_not_lost(
     await wait_for(lambda: streams_expired(run_id))
     assert saves == 2
     assert await status_is(run_id, "done")
-    body = await runs.get_result_body(app.state.pool, run_id)
+    body = await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID)
     assert body is not None and gzip.decompress(body) == b'{"graph": {}}'
 
 
@@ -139,13 +139,13 @@ async def test_cancelling_batch_waits_for_worker_release_and_discards_its_final(
     with anyio.fail_after(10):
         await waiting.wait()
     assert await status_is(run_id, "cancelling") and not await streams_expired(run_id)
-    assert await runs.get_result_body(app.state.pool, run_id) is None
+    assert await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID) is None
 
     sync_redis.xack("pending_runs", "workers", job_id)
     sync_redis.xdel("pending_runs", job_id)
     await wait_for(lambda: streams_expired(run_id))
     assert await status_is(run_id, "cancelled")
-    assert await runs.get_result_body(app.state.pool, run_id) is None
+    assert await runs.get_result_body(app.state.pool, run_id, TEST_USER_ID) is None
     assert f"POST /runs/{run_id}/cancel" not in runner.calls
 
 
@@ -155,7 +155,7 @@ async def test_cancellation_survives_restart_and_retries_an_unreachable_runner(
     run_id = "run-20261027T000000Z-c4c4c4c4"
     monkeypatch.setattr(supervisor, "RUNNER_MIA_SECONDS", 0)
     async with running_app():
-        await runs.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
         sync_redis.xadd("pending_runs", {"run_id": run_id, "stream": "false", "config": "{}"})
         await runs.set_cancelling(app.state.pool, run_id)
 
@@ -187,7 +187,7 @@ async def test_orphaned_saved_run_without_a_queued_job_is_cleaned_up(running_app
     runner.status = httpx.Response(404)
 
     async with running_app():
-        await runs.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
 
     async with running_app():
         await wait_for(lambda: streams_expired(run_id))
@@ -204,7 +204,7 @@ async def test_stopped_run_with_lost_terminal_entry_is_cleaned_after_restart(
     runner.state = "finished"
 
     async with running_app():
-        await runs.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
         if status == "failed":
             await runs.set_failed(app.state.pool, run_id, "runner", "runner failed")
         else:
@@ -230,7 +230,7 @@ async def test_pending_job_prevents_early_cleanup_until_worker_finishes(
     runner.state = "finished"
 
     async with running_app():
-        await runs.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
         await runs.set_failed(app.state.pool, run_id, "runner", "runner failed")
         sync_redis.xadd("pending_runs", {"run_id": run_id, "stream": "false", "config": "{}"})
         if claimed:
@@ -322,7 +322,7 @@ async def test_supervisor_errors_fail_the_run_only_after_several_in_a_row(
 async def test_done_run_whose_streams_expired_is_finished_after_a_restart(running_app: Callable[[], Any], runner: FakeRunner) -> None:
     run_id = "run-20261027T000000Z-d0d0d0d0"
     async with running_app():
-        await runs.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
         await runs.save_result(app.state.pool, run_id, gzip.compress(b"{}"))
 
     runner.state = "finished"
@@ -333,7 +333,7 @@ async def test_done_run_whose_streams_expired_is_finished_after_a_restart(runnin
 
 
 async def test_api_restart_reattaches_unfinished_runs(running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis) -> None:
-    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as api:
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api", headers=AUTH_HEADERS) as api:
         run_id = await create_run(api)
 
     runner.state = "finished"

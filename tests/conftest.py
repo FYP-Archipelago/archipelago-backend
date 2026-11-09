@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import psycopg
@@ -18,10 +19,22 @@ from fastapi import FastAPI
 os.environ["ARCHIPELAGO_DATABASE_URL"] = os.environ["ARCHIPELAGO_TEST_DATABASE_URL"]
 os.environ["ARCHIPELAGO_REDIS_URL"] = os.environ["ARCHIPELAGO_TEST_REDIS_URL"]
 os.environ["ARCHIPELAGO_RUNNER_URL"] = "http://runner"
+os.environ["ARCHIPELAGO_CORS_ORIGIN"] = "http://localhost:5173"
+os.environ["ARCHIPELAGO_COOKIE_SECURE"] = "false"
 
 from app import runner as runner_client
 from app.main import app, lifespan
+from app.security import hash_token, mint_token
+from app.settings import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME
 
+TEST_USER_ID = uuid4()
+ACCESS_TOKEN = mint_token()
+REFRESH_TOKEN = mint_token()
+AUTH_HEADERS = {
+    "Origin": "http://localhost:5173",
+    "X-CSRF-Token": mint_token(),
+    "Cookie": f"{ACCESS_COOKIE_NAME}={ACCESS_TOKEN}; {REFRESH_COOKIE_NAME}={REFRESH_TOKEN}",
+}
 SYNTHETIC_RUN_ID = "run-20261027T000000Z-5e1f0c0d"
 SCHEMA = Path(__file__).parents[1] / "app" / "db" / "schema.sql"
 
@@ -153,7 +166,20 @@ def clean_stores(sync_redis: redis.Redis) -> None:
     sync_redis.flushdb()
     with psycopg.connect(os.environ["ARCHIPELAGO_DATABASE_URL"], autocommit=True) as conn:
         conn.execute(SCHEMA.read_text())
-        conn.execute("TRUNCATE runs CASCADE")
+        conn.execute("TRUNCATE users CASCADE")
+
+
+@pytest.fixture
+def run_user(clean_stores: None) -> None:
+    with psycopg.connect(os.environ["ARCHIPELAGO_DATABASE_URL"], autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, full_name) VALUES (%s, 'run-test@example.com', 'unused', 'Researcher')", (TEST_USER_ID,)
+        )
+        conn.execute(
+            "INSERT INTO auth_sessions (id, user_id, access_token_hash, refresh_token_hash, csrf_token, access_expires_at, refresh_expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, now() + interval '4 hours', now() + interval '30 days')",
+            (uuid4(), TEST_USER_ID, hash_token(ACCESS_TOKEN), hash_token(REFRESH_TOKEN), AUTH_HEADERS["X-CSRF-Token"]),
+        )
 
 
 @pytest.fixture
@@ -177,8 +203,14 @@ def running_app(runner: FakeRunner, monkeypatch: pytest.MonkeyPatch) -> Callable
 
 
 @pytest.fixture
-async def api(running_app: Callable[[], Any]) -> AsyncGenerator[httpx.AsyncClient]:
+async def browser(running_app: Callable[[], Any]) -> AsyncGenerator[httpx.AsyncClient]:
     async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as client:
+        yield client
+
+
+@pytest.fixture
+async def api(running_app: Callable[[], Any], run_user: None) -> AsyncGenerator[httpx.AsyncClient]:
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api", headers=AUTH_HEADERS) as client:
         yield client
 
 
