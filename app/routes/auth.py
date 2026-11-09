@@ -27,18 +27,24 @@ def _session_response(user: User, session: Session) -> SessionResponse:
     )
 
 
-async def _create_session(conn: AsyncConnection[dict[str, Any]], user_id: UUID, request: Request) -> tuple[Session, str, str]:
+async def _get_cookie_session(conn: AsyncConnection[dict[str, Any]], request: Request) -> Session | None:
     now = datetime.now(UTC)
-    previous = None
+    session = None
     refresh = request.cookies.get(REFRESH_COOKIE_NAME, "")
     access = request.cookies.get(ACCESS_COOKIE_NAME, "")
     if refresh:
-        previous = await auth.get_session_by_refresh_hash(conn, security.hash_token(refresh), now)
-    if previous is None and access:
-        previous = await auth.get_session_by_access_hash(conn, security.hash_token(access), now)
+        session = await auth.get_session_by_refresh_hash(conn, security.hash_token(refresh), now)
+    if session is None and access:
+        session = await auth.get_session_by_access_hash(conn, security.hash_token(access), now)
+    return session
+
+
+async def _create_session(conn: AsyncConnection[dict[str, Any]], user_id: UUID, request: Request) -> tuple[Session, str, str]:
+    previous = await _get_cookie_session(conn, request)
     if previous is not None:
         await auth.delete_session(conn, previous.id)
 
+    now = datetime.now(UTC)
     access, refresh = security.mint_token(), security.mint_token()
     session = await auth.insert_session(
         conn, user_id, security.hash_token(access), security.hash_token(refresh), security.mint_token(), now + ACCESS_LIFETIME, now + REFRESH_LIFETIME
@@ -119,3 +125,18 @@ async def refresh_session(request: Request, response: Response) -> SessionRespon
         )
     _set_cookies(response, state.settings, session, access, refresh)
     return _session_response(user, session)
+
+
+@router.post("/logout", status_code=204)
+async def logout(request: Request) -> Response:
+    state = request.app.state
+    if request.cookies.get(REFRESH_COOKIE_NAME) or request.cookies.get(ACCESS_COOKIE_NAME):
+        async with state.pool.connection() as conn, conn.transaction():
+            session = await _get_cookie_session(conn, request)
+            if session is not None:
+                await auth.delete_session(conn, session.id)
+
+    response = Response(status_code=204)
+    for name in (ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME):
+        response.delete_cookie(name, path="/", secure=state.settings.cookie_secure, httponly=True, samesite="lax")
+    return response

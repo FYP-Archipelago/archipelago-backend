@@ -1,6 +1,8 @@
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 
 import psycopg
 from fastapi import FastAPI, Request
@@ -8,12 +10,13 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from psycopg_pool import AsyncConnectionPool
 from redis.asyncio import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
 from app import __version__, runner
-from app.db import apply_schema, open_pool, runs
+from app.db import apply_schema, auth, open_pool, runs
 from app.middleware import AuthRequestMiddleware
 from app.redis_names import GROUP, PENDING_RUNS
 from app.routes import router
@@ -22,10 +25,22 @@ from app.supervisor import cancel_all, start_supervisor
 
 # one per open SSE viewer (each blocked XREAD holds a connection) and per supervisor, plus headroom
 REDIS_MAX_CONNECTIONS = 200
+SESSION_CLEANUP_SECONDS = 3600
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 settings = load_settings()
+
+
+async def _cleanup_sessions(pool: AsyncConnectionPool) -> None:
+    while True:
+        try:
+            async with pool.connection() as conn:
+                await auth.delete_expired_sessions(conn, datetime.now(UTC))
+        except psycopg.Error:
+            logger.exception("Expired session cleanup failed")
+        await asyncio.sleep(SESSION_CLEANUP_SECONDS)
 
 
 @asynccontextmanager
@@ -47,12 +62,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     for run_id in await runs.list_unexpired(pool):
         start_supervisor(run_id, pool, redis, client)
 
-    yield
-
-    await cancel_all()
-    await client.aclose()
-    await redis.aclose()
-    await pool.close()
+    cleanup = asyncio.create_task(_cleanup_sessions(pool), name="session-cleanup")
+    try:
+        yield
+    finally:
+        cleanup.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup
+        await cancel_all()
+        await client.aclose()
+        await redis.aclose()
+        await pool.close()
 
 
 app = FastAPI(title="archipelago-backend", version=__version__, lifespan=lifespan)
