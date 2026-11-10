@@ -1,0 +1,15 @@
+meta {
+  name: Get Result
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{base_url}}/runs/{{run_id}}/result
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}

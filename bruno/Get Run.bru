@@ -1,0 +1,15 @@
+meta {
+  name: Get Run
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{base_url}}/runs/{{run_id}}
+  body: none
+  auth: none
+}
+
+headers {
+  Accept: application/json
+}

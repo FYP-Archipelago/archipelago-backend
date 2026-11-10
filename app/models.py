@@ -4,7 +4,7 @@ from typing import Any, Literal
 from archipelago import Config
 from pydantic import BaseModel, ConfigDict
 
-Status = Literal["queued", "running", "clustering", "done", "failed", "cancelled"]
+Status = Literal["queued", "running", "clustering", "done", "failed", "cancelling", "cancelled"]
 Phase = Literal["runner", "clustering", "internal"]
 
 
@@ -32,3 +32,8 @@ class RunStatus(BaseModel):
     error: RunError | None
     created_at: datetime
     updated_at: datetime
+
+
+class RunPage(BaseModel):
+    runs: list[RunStatus]
+    next_cursor: str | None

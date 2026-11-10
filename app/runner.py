@@ -41,6 +41,17 @@ def _error_text(response: httpx.Response) -> str:
     return str(body["error"]) if isinstance(body, dict) and "error" in body else response.text
 
 
+async def health(client: httpx.AsyncClient) -> bool:
+    response = await _request(client, "GET", "/health")
+    if response.status_code != 200:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("status") == "ok"
+
+
 async def presets(client: httpx.AsyncClient) -> bytes:
     response = await _request(client, "GET", "/presets")
     if response.status_code != 200:
