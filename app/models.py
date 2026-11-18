@@ -15,7 +15,7 @@ class CreateRun(BaseModel):
 
     run_name: RunName
     preset: str
-    overrides: dict[str, Any] = {}
+    run_settings: dict[str, Any]
     stream: bool = False
     clustering: Config
 
@@ -31,7 +31,7 @@ class RunStatus(BaseModel):
     status: Status
     stream: bool
     preset: str
-    overrides: dict[str, Any]
+    run_settings: dict[str, Any]
     clustering: Config
     error: RunError | None
     created_at: datetime

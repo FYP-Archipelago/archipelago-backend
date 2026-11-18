@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS runs (
     status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'clustering', 'done', 'failed', 'cancelling', 'cancelled')),
     stream boolean NOT NULL,
     preset text NOT NULL,
-    overrides jsonb NOT NULL DEFAULT '{}',
+    run_settings jsonb NOT NULL,
     clustering jsonb NOT NULL,
     error_phase text CHECK (error_phase IN ('runner', 'clustering', 'internal')),
     error_message text,

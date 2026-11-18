@@ -32,7 +32,7 @@ def _to_run_status(row: dict[str, Any]) -> RunStatus:
         status=row["status"],
         stream=row["stream"],
         preset=row["preset"],
-        overrides=row["overrides"],
+        run_settings=row["run_settings"],
         clustering=row["clustering"],
         error=error,
         created_at=row["created_at"],
@@ -43,8 +43,8 @@ def _to_run_status(row: dict[str, Any]) -> RunStatus:
 async def insert_run(pool: AsyncConnectionPool, run_id: str, body: CreateRun) -> RunStatus:
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO runs (run_id, run_name, stream, preset, overrides, clustering) VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
-            (run_id, body.run_name, body.stream, body.preset, Jsonb(body.overrides), Jsonb(body.clustering.model_dump(mode="json"))),
+            "INSERT INTO runs (run_id, run_name, stream, preset, run_settings, clustering) VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+            (run_id, body.run_name, body.stream, body.preset, Jsonb(body.run_settings), Jsonb(body.clustering.model_dump(mode="json"))),
         )
         row = await cur.fetchone()
     assert row is not None
