@@ -1,27 +1,14 @@
 from datetime import datetime
-from pathlib import Path
 from typing import Any
+from uuid import UUID
 
-from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from app.models import CreateRun, Phase, RunError, RunStatus, Status
+from app.models.runs import CreateRun, Phase, RunError, RunStatus, Status
 
-SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 ORDER: list[Status] = ["queued", "running", "clustering", "done"]
 PROGRESS_STATUSES = ["queued", "running", "clustering"]
-
-
-async def open_pool(url: str) -> AsyncConnectionPool:
-    pool = AsyncConnectionPool(url, open=False, kwargs={"row_factory": dict_row})
-    await pool.open(wait=True)
-    return pool
-
-
-async def apply_schema(pool: AsyncConnectionPool) -> None:
-    async with pool.connection() as conn:
-        await conn.execute(SCHEMA_PATH.read_text())
 
 
 def _to_run_status(row: dict[str, Any]) -> RunStatus:
@@ -39,11 +26,11 @@ def _to_run_status(row: dict[str, Any]) -> RunStatus:
     )
 
 
-async def insert_run(pool: AsyncConnectionPool, run_id: str, body: CreateRun) -> RunStatus:
+async def insert_run(pool: AsyncConnectionPool, run_id: str, user_id: UUID, body: CreateRun) -> RunStatus:
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO runs (run_id, stream, preset, overrides, clustering) VALUES (%s, %s, %s, %s, %s) RETURNING *",
-            (run_id, body.stream, body.preset, Jsonb(body.overrides), Jsonb(body.clustering.model_dump(mode="json"))),
+            "INSERT INTO runs (run_id, user_id, stream, preset, overrides, clustering) VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+            (run_id, user_id, body.stream, body.preset, Jsonb(body.overrides), Jsonb(body.clustering.model_dump(mode="json"))),
         )
         row = await cur.fetchone()
     assert row is not None
@@ -57,11 +44,18 @@ async def get_run(pool: AsyncConnectionPool, run_id: str) -> RunStatus | None:
     return _to_run_status(row) if row else None
 
 
+async def get_owned_run(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> RunStatus | None:
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM runs WHERE run_id = %s AND user_id = %s", (run_id, user_id))
+        row = await cur.fetchone()
+    return _to_run_status(row) if row else None
+
+
 async def list_runs(
-    pool: AsyncConnectionPool, limit: int, status: Status | None, preset: str | None, before: tuple[datetime, str] | None
+    pool: AsyncConnectionPool, user_id: UUID, limit: int, status: Status | None, preset: str | None, before: tuple[datetime, str] | None
 ) -> list[RunStatus]:
-    conditions = []
-    values: list[Any] = []
+    conditions = ["user_id = %s"]
+    values: list[Any] = [user_id]
     if status is not None:
         conditions.append("status = %s")
         values.append(status)
@@ -71,7 +65,7 @@ async def list_runs(
     if before is not None:
         conditions.append("(created_at, run_id) < (%s, %s)")
         values.extend(before)
-    where = " WHERE " + " AND ".join(conditions) if conditions else ""
+    where = " WHERE " + " AND ".join(conditions)
     async with pool.connection() as conn:
         cur = await conn.execute(
             f"SELECT * FROM runs{where} ORDER BY created_at DESC, run_id DESC LIMIT %s",
@@ -103,6 +97,17 @@ async def set_cancelling(pool: AsyncConnectionPool, run_id: str) -> None:
             "UPDATE runs SET status = 'cancelling', updated_at = now() WHERE run_id = %s AND status = ANY(%s)",
             (run_id, PROGRESS_STATUSES),
         )
+
+
+async def request_run_cancellation(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> RunStatus | None:
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE runs SET status = 'cancelling', updated_at = now() WHERE run_id = %s AND user_id = %s AND status = ANY(%s)",
+            (run_id, user_id, PROGRESS_STATUSES),
+        )
+        cur = await conn.execute("SELECT * FROM runs WHERE run_id = %s AND user_id = %s", (run_id, user_id))
+        row = await cur.fetchone()
+    return _to_run_status(row) if row else None
 
 
 async def save_result(pool: AsyncConnectionPool, run_id: str, body: bytes) -> None:

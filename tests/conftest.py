@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import psycopg
@@ -14,14 +15,27 @@ import pytest
 import redis
 from fastapi import FastAPI
 
-# the tests wipe both stores, so they only run against the ones named for them, never a dev .env
+# The tests wipe both stores, so they only run against the ones named for them, never a dev .env
 os.environ["ARCHIPELAGO_DATABASE_URL"] = os.environ["ARCHIPELAGO_TEST_DATABASE_URL"]
 os.environ["ARCHIPELAGO_REDIS_URL"] = os.environ["ARCHIPELAGO_TEST_REDIS_URL"]
 os.environ["ARCHIPELAGO_RUNNER_URL"] = "http://runner"
+os.environ["ARCHIPELAGO_CORS_ORIGIN"] = "http://localhost:5173"
+os.environ["ARCHIPELAGO_COOKIE_SECURE"] = "false"
 
 from app import runner as runner_client
+from app.auth import ACCESS_COOKIE, REFRESH_COOKIE, hash_token, mint_token
 from app.main import app, lifespan
 
+ORIGIN = "http://localhost:5173"
+DIGEST = hashlib.sha256(b"a password").hexdigest()
+REGISTRATION = {"email": " Researcher@Example.COM ", "password_digest": DIGEST, "full_name": " Researcher ", "institution": " Team 21 "}
+LOGIN = {"email": "researcher@example.com", "password_digest": DIGEST}
+
+# A user with a ready session, for tests that aren't about auth
+TEST_USER_ID = uuid4()
+ACCESS_TOKEN = mint_token()
+REFRESH_TOKEN = mint_token()
+AUTH_HEADERS = {"Origin": ORIGIN, "X-CSRF-Token": mint_token(), "Cookie": f"{ACCESS_COOKIE}={ACCESS_TOKEN}; {REFRESH_COOKIE}={REFRESH_TOKEN}"}
 SYNTHETIC_RUN_ID = "run-20261027T000000Z-5e1f0c0d"
 SCHEMA = Path(__file__).parents[1] / "app" / "db" / "schema.sql"
 
@@ -68,10 +82,9 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-# A small island-model run as runner_logs entries, in the order the runner writes them: run and
-# island starts, then each island's rows and migration arrivals in seq order (islands taking turns),
-# then the ends. Each island random-walks from its own start, every seventh child repeats its
-# parent's genome, and two migrants per island arrive from the next island.
+# A small island-model run as runner_logs entries, in the order the runner writes them.
+# That is the run and island starts, then each island's rows and migration arrivals in seq order (islands taking turns), then the ends.
+# Each island random-walks from its own start, every seventh child repeats its parent's genome, and each island gets two migrants from the next one.
 @pytest.fixture(scope="session")
 def log_entries(per_island: int = 150, islands: int = 3, dimension: int = 4) -> list[dict[str, Any]]:
     rng = random.Random(1)
@@ -153,7 +166,20 @@ def clean_stores(sync_redis: redis.Redis) -> None:
     sync_redis.flushdb()
     with psycopg.connect(os.environ["ARCHIPELAGO_DATABASE_URL"], autocommit=True) as conn:
         conn.execute(SCHEMA.read_text())
-        conn.execute("TRUNCATE runs CASCADE")
+        conn.execute("TRUNCATE users CASCADE")
+
+
+@pytest.fixture
+def run_user(clean_stores: None) -> None:
+    with psycopg.connect(os.environ["ARCHIPELAGO_DATABASE_URL"], autocommit=True) as conn:
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, full_name) VALUES (%s, 'run-test@example.com', 'unused', 'Researcher')", (TEST_USER_ID,)
+        )
+        conn.execute(
+            "INSERT INTO auth_sessions (id, user_id, access_token_hash, refresh_token_hash, csrf_token, access_expires_at, refresh_expires_at) "
+            "VALUES (%s, %s, %s, %s, %s, now() + interval '4 hours', now() + interval '30 days')",
+            (uuid4(), TEST_USER_ID, hash_token(ACCESS_TOKEN), hash_token(REFRESH_TOKEN), AUTH_HEADERS["X-CSRF-Token"]),
+        )
 
 
 @pytest.fixture
@@ -167,7 +193,7 @@ def running_app(runner: FakeRunner, monkeypatch: pytest.MonkeyPatch) -> Callable
         runner_client, "make_client", lambda base_url: httpx.AsyncClient(transport=httpx.MockTransport(runner.handle), base_url=base_url)
     )
 
-    # each `async with running_app()` is one API process lifetime, so a test can restart it
+    # Each `async with running_app()` is one API process lifetime, so a test can restart it
     @asynccontextmanager
     async def start() -> AsyncGenerator[FastAPI]:
         async with lifespan(app):
@@ -177,8 +203,14 @@ def running_app(runner: FakeRunner, monkeypatch: pytest.MonkeyPatch) -> Callable
 
 
 @pytest.fixture
-async def api(running_app: Callable[[], Any]) -> AsyncGenerator[httpx.AsyncClient]:
+async def browser(running_app: Callable[[], Any]) -> AsyncGenerator[httpx.AsyncClient]:
     async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as client:
+        yield client
+
+
+@pytest.fixture
+async def api(running_app: Callable[[], Any], run_user: None) -> AsyncGenerator[httpx.AsyncClient]:
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api", headers=AUTH_HEADERS) as client:
         yield client
 
 
@@ -187,6 +219,30 @@ def push_logs(client: redis.Redis, run_id: str, entries: list[dict[str, Any]]) -
     for entry in entries:
         pipe.xadd(f"run:{run_id}:runner_logs", {"kind": entry["kind"], "data": json.dumps(entry["data"])})
     return pipe.execute()
+
+
+async def register(client: httpx.AsyncClient, **values: str) -> httpx.Response:
+    response = await client.post("/auth/register", json={**REGISTRATION, **values}, headers={"Origin": ORIGIN, "Cookie": ""})
+    assert response.status_code == 201, response.text
+    return response
+
+
+# Each test client keeps one cookie jar, so tests acting as several browsers send each one's cookies explicitly.
+def cookie_headers(response: httpx.Response) -> dict[str, str]:
+    return {"Origin": ORIGIN, "Cookie": f"{ACCESS_COOKIE}={response.cookies[ACCESS_COOKIE]}; {REFRESH_COOKIE}={response.cookies[REFRESH_COOKIE]}"}
+
+
+def csrf_headers(response: httpx.Response) -> dict[str, str]:
+    return {**cookie_headers(response), "X-CSRF-Token": response.json()["csrf_token"]}
+
+
+def parse_sse(text: str) -> list[tuple[str, str | None, Any]]:
+    events = []
+    for block in text.strip().split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines() if not line.startswith(":"))
+        if lines:
+            events.append((lines["event"], lines.get("id"), json.loads(lines["data"])))
+    return events
 
 
 def without_elapsed(result_json: str | bytes) -> dict[str, Any]:

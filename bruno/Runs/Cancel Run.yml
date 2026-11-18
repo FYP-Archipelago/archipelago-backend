@@ -1,0 +1,22 @@
+info:
+  name: Cancel Run
+  type: http
+  seq: 11
+
+http:
+  method: POST
+  url: "{{base_url}}/runs/{{run_id}}/cancel"
+  headers:
+    - name: Origin
+      value: "{{origin}}"
+    - name: X-CSRF-Token
+      value: "{{csrf_token}}"
+    - name: Accept
+      value: application/json
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: true

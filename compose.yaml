@@ -28,7 +28,8 @@ services:
       ARCHIPELAGO_DATABASE_URL: postgresql://archipelago:${POSTGRES_PASSWORD}@db:5432/archipelago
       ARCHIPELAGO_REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       ARCHIPELAGO_RUNNER_URL: ${ARCHIPELAGO_RUNNER_URL:?}
-      ARCHIPELAGO_CORS_ORIGINS: ${ARCHIPELAGO_CORS_ORIGINS:-*}
+      ARCHIPELAGO_CORS_ORIGIN: ${ARCHIPELAGO_CORS_ORIGIN:?}
+      ARCHIPELAGO_COOKIE_SECURE: ${ARCHIPELAGO_COOKIE_SECURE:-true}
     ports: ["8000:8000"]
     depends_on:
       db: {condition: service_healthy}
@@ -50,7 +51,7 @@ services:
     environment:
       PORT: 4983
       STORE_PATH: /app
-      MASTERPASS: ${DRIZZLE_MASTERPASS:-}
+      MASTERPASS: archipelago
     volumes: [drizzle:/app]
     ports: ["127.0.0.1:4983:4983"]
   redisinsight:

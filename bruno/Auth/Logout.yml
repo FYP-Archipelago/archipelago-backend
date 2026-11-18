@@ -1,0 +1,25 @@
+info:
+  name: Logout
+  type: http
+  seq: 16
+
+http:
+  method: POST
+  url: "{{base_url}}/auth/logout"
+  headers:
+    - name: Accept
+      value: application/json
+    - name: Content-Type
+      value: application/json
+    - name: Origin
+      value: "{{origin}}"
+  body:
+    type: json
+    data: "{}"
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: true

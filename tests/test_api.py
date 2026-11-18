@@ -1,19 +1,22 @@
 import asyncio
+import base64
 import gzip
 import json
 from typing import Any
+from uuid import UUID
 
 import httpx
 import psycopg
 import pytest
 import redis
 from archipelago import Config
+from psycopg_pool import AsyncConnectionPool
 
 from app import runner as runner_client
-from app.db import queries
+from app.db import runs
 from app.main import app
-from app.models import CreateRun
-from tests.conftest import FakeRunner
+from app.models.runs import CreateRun, RunStatus
+from tests.conftest import TEST_USER_ID, FakeRunner, parse_sse
 
 pytestmark = pytest.mark.anyio
 
@@ -21,25 +24,16 @@ BODY: dict[str, Any] = {"preset": "de-rastrigin", "overrides": {"num_islands": 4
 RUN_ID = "run-20261027T000000Z-0123abcd"
 
 
-def parse_sse(text: str) -> list[tuple[str, str | None, Any]]:
-    events = []
-    for block in text.strip().split("\n\n"):
-        lines = dict(line.split(": ", 1) for line in block.splitlines() if not line.startswith(":"))
-        if lines:
-            events.append((lines["event"], lines.get("id"), json.loads(lines["data"])))
-    return events
-
-
 async def seed_run(status: str = "queued", stream: bool = True) -> None:
-    await queries.insert_run(app.state.pool, RUN_ID, CreateRun.model_validate({**BODY, "stream": stream}))
+    await runs.insert_run(app.state.pool, RUN_ID, TEST_USER_ID, CreateRun.model_validate({**BODY, "stream": stream}))
     if status == "failed":
-        await queries.set_failed(app.state.pool, RUN_ID, "clustering", "boom")
+        await runs.set_failed(app.state.pool, RUN_ID, "clustering", "boom")
     elif status in ("cancelling", "cancelled"):
-        await queries.set_cancelling(app.state.pool, RUN_ID)
+        await runs.set_cancelling(app.state.pool, RUN_ID)
         if status == "cancelled":
-            await queries.finish_cleanup(app.state.pool, RUN_ID)
+            await runs.finish_cleanup(app.state.pool, RUN_ID)
     elif status != "queued":
-        await queries.advance_status(app.state.pool, RUN_ID, status)
+        await runs.advance_status(app.state.pool, RUN_ID, status)
 
 
 async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx.AsyncClient, runner: FakeRunner, sync_redis: redis.Redis) -> None:
@@ -62,7 +56,7 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
 async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:
     ids = [f"run-20261027T000000Z-{value:08x}" for value in range(1, 42)]
     for run_id in ids:
-        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate(BODY))
+        await runs.insert_run(app.state.pool, run_id, TEST_USER_ID, CreateRun.model_validate(BODY))
     async with app.state.pool.connection() as conn:
         await conn.execute("UPDATE runs SET created_at = '2026-10-27T00:00:00Z'")
     expected = ids[::-1]
@@ -73,7 +67,7 @@ async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: http
     assert (await api.get("/runs", params={"limit": 1})).json() == first.json()
     cursor = first.json()["next_cursor"]
     assert (await api.get("/runs", params={"cursor": cursor + "!!!!"})).status_code == 422
-    await queries.insert_run(app.state.pool, "run-20261027T000000Z-0000002a", CreateRun.model_validate(BODY))
+    await runs.insert_run(app.state.pool, "run-20261027T000000Z-0000002a", TEST_USER_ID, CreateRun.model_validate(BODY))
 
     second = await api.get("/runs", params={"cursor": cursor})
     assert [run["run_id"] for run in second.json()["runs"]] == expected[20:40]
@@ -84,9 +78,9 @@ async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: http
 
 async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClient, runner: FakeRunner) -> None:
     await seed_run("failed")
-    await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000001", CreateRun.model_validate({**BODY, "preset": "other"}))
-    await queries.insert_run(app.state.pool, "run-20261027T000000Z-00000002", CreateRun.model_validate(BODY))
-    await queries.advance_status(app.state.pool, "run-20261027T000000Z-00000002", "running")
+    await runs.insert_run(app.state.pool, "run-20261027T000000Z-00000001", TEST_USER_ID, CreateRun.model_validate({**BODY, "preset": "other"}))
+    await runs.insert_run(app.state.pool, "run-20261027T000000Z-00000002", TEST_USER_ID, CreateRun.model_validate(BODY))
+    await runs.advance_status(app.state.pool, "run-20261027T000000Z-00000002", "running")
     response = await api.get("/runs", params={"status": "failed", "preset": "de-rastrigin"})
     assert response.status_code == 200
     [run] = response.json()["runs"]
@@ -97,6 +91,49 @@ async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClien
     assert runner.calls == []
     empty = await api.get("/runs", params={"preset": "removed-preset"})
     assert empty.json() == {"runs": [], "next_cursor": None}
+
+
+def cursor(value: object) -> str:
+    return base64.urlsafe_b64encode(json.dumps(value).encode()).decode()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"cursor": "not base64!"},
+        {"cursor": cursor(["2026-10-27T00:00:00+00:00", RUN_ID])},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00+00:00"})},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00", "run_id": RUN_ID})},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00+05:30", "run_id": RUN_ID})},
+        {"cursor": cursor({"created_at": "2026-10-27T00:00:00+00:00", "run_id": "run-1"})},
+    ],
+)
+async def test_malformed_history_cursors_are_422(api: httpx.AsyncClient, params: dict[str, str]) -> None:
+    r = await api.get("/runs", params=params)
+
+    assert r.status_code == 422 and r.json() == {"detail": "Invalid cursor"}
+
+
+async def test_unknown_history_status_is_422(api: httpx.AsyncClient) -> None:
+    assert (await api.get("/runs", params={"status": "finished"})).status_code == 422
+
+
+# Users' runs and results must never sit in a browser's disk cache, where they stay readable after logout.
+async def test_every_kind_of_response_is_marked_no_store(api: httpx.AsyncClient) -> None:
+    await seed_run()
+    await runs.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
+
+    responses = [
+        await api.get("/runs"),
+        await api.get(f"/runs/{RUN_ID}/result"),
+        await api.get(f"/runs/{RUN_ID}/events"),
+        await api.get("/runs/not-a-run"),
+        await api.get("/runs", headers={"Cookie": ""}),
+        await api.get("/health"),
+    ]
+
+    assert [r.status_code for r in responses] == [200, 200, 200, 404, 401, 200]
+    assert all(r.headers["cache-control"] == "no-store" for r in responses)
 
 
 async def test_run_lookup_returns_the_same_metadata_as_history(api: httpx.AsyncClient, runner: FakeRunner) -> None:
@@ -129,7 +166,7 @@ async def test_runner_rejection_fails_the_run_and_aborts_the_job(api: httpx.Asyn
     assert r.json() == {"detail": "unknown preset 'de-rastrigin'"}
     [(_, job)] = sync_redis.xrange("pending_runs")
     run_id = job[b"run_id"].decode()
-    run = await queries.get_run(app.state.pool, run_id)
+    run = await runs.get_run(app.state.pool, run_id)
     assert run is not None and run.status == "failed"
     assert run.error is not None and (run.error.phase, run.error.message) == ("runner", "unknown preset 'de-rastrigin'")
     [(_, abort)] = sync_redis.xrange(f"run:{run_id}:runner_logs")
@@ -153,7 +190,7 @@ async def test_failed_start_gives_502_and_fails_the_run(
 
     assert r.status_code == 502
     [(_, job)] = sync_redis.xrange("pending_runs")
-    run = await queries.get_run(app.state.pool, job[b"run_id"].decode())
+    run = await runs.get_run(app.state.pool, job[b"run_id"].decode())
     assert run is not None and run.status == "failed" and run.error is not None and run.error.phase == "runner"
     assert run.error.message == r.json()["detail"] and message in run.error.message
 
@@ -199,11 +236,11 @@ async def test_malformed_and_unknown_runs_are_404(api: httpx.AsyncClient, path: 
     r = await api.get(path)
 
     assert r.status_code == 404
-    assert r.json() == {"detail": "run not found"}
+    assert r.json() == {"detail": "Run not found"}
 
 
 @pytest.mark.parametrize(
-    ("status", "detail"), [("running", "no result: run is running"), ("failed", "no result: run failed"), ("cancelled", "no result: run cancelled")]
+    ("status", "detail"), [("running", "No result: run is running"), ("failed", "No result: run failed"), ("cancelled", "No result: run cancelled")]
 )
 async def test_result_is_404_until_the_run_is_done(api: httpx.AsyncClient, status: str, detail: str) -> None:
     await seed_run(status)
@@ -218,7 +255,7 @@ async def test_result_is_404_until_the_run_is_done(api: httpx.AsyncClient, statu
 async def test_result_is_served_as_stored(api: httpx.AsyncClient, accept: str, encoding: str | None) -> None:
     final = b'{"graph": {"nodes": [1, 2, 3]}}'
     await seed_run()
-    await queries.save_result(app.state.pool, RUN_ID, gzip.compress(final))
+    await runs.save_result(app.state.pool, RUN_ID, gzip.compress(final))
 
     r = await api.get(f"/runs/{RUN_ID}/result", headers={"Accept-Encoding": accept})
 
@@ -261,7 +298,7 @@ async def test_events_give_the_error_not_a_final_for_a_run_that_already_failed(a
 
 async def test_events_of_a_done_run_with_expired_streams_say_done(api: httpx.AsyncClient) -> None:
     await seed_run()
-    await queries.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
+    await runs.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
 
     events = parse_sse((await api.get(f"/runs/{RUN_ID}/events")).text)
 
@@ -273,7 +310,7 @@ async def test_cancel_of_a_malformed_or_unknown_run_is_404(api: httpx.AsyncClien
     r = await api.post(path)
 
     assert r.status_code == 404
-    assert r.json() == {"detail": "run not found"}
+    assert r.json() == {"detail": "Run not found"}
     assert runner.calls == []
 
 
@@ -307,13 +344,13 @@ async def test_cancel_records_the_request_without_waiting_for_the_runner(api: ht
 # A result saved before the cancellation request wins the state transition.
 async def test_cancel_that_loses_to_the_result_returns_the_done_run(api: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
     await seed_run("running")
-    set_cancelling = queries.set_cancelling
+    request_run_cancellation = runs.request_run_cancellation
 
-    async def result_saved_first(pool: object, run_id: str) -> None:
-        await queries.save_result(app.state.pool, run_id, b"result")
-        await set_cancelling(app.state.pool, run_id)
+    async def result_saved_first(pool: AsyncConnectionPool, run_id: str, user_id: UUID) -> RunStatus | None:
+        await runs.save_result(pool, run_id, b"result")
+        return await request_run_cancellation(pool, run_id, user_id)
 
-    monkeypatch.setattr(queries, "set_cancelling", result_saved_first)
+    monkeypatch.setattr(runs, "request_run_cancellation", result_saved_first)
 
     response = await api.post(f"/runs/{RUN_ID}/cancel")
 
@@ -324,7 +361,7 @@ async def test_cancel_that_loses_to_the_result_returns_the_done_run(api: httpx.A
 async def test_events_of_a_cancelled_run_end_with_the_status_only(api: httpx.AsyncClient, sync_redis: redis.Redis) -> None:
     await seed_run("cancelled")
     sync_redis.xadd(f"run:{RUN_ID}:clustered", {"update": '{"n": 1}'})
-    sync_redis.xadd(f"run:{RUN_ID}:clustered", {"phase": "runner", "error": "run cancelled"})
+    sync_redis.xadd(f"run:{RUN_ID}:clustered", {"phase": "runner", "error": "Run cancelled"})
     sync_redis.xadd(f"run:{RUN_ID}:clustered", {"final": '{"n": 3}'})
 
     events = parse_sse((await api.get(f"/runs/{RUN_ID}/events")).text)
@@ -350,12 +387,12 @@ async def test_events_wait_for_cancellation_and_ignore_late_worker_messages(
     response = asyncio.create_task(api.get(f"/runs/{RUN_ID}/events"))
     try:
         await asyncio.wait_for(started.wait(), 3)
-        await queries.set_cancelling(app.state.pool, RUN_ID)
-        for fields in ({"update": '{"n": 1}'}, {"phase": "runner", "error": "run cancelled"}, {"final": '{"n": 3}'}):
+        await runs.set_cancelling(app.state.pool, RUN_ID)
+        for fields in ({"update": '{"n": 1}'}, {"phase": "runner", "error": "Run cancelled"}, {"final": '{"n": 3}'}):
             last_id = sync_redis.xadd(f"run:{RUN_ID}:clustered", fields).decode()
         await asyncio.wait_for(waiting.wait(), 3)
         assert not response.done()
-        await queries.finish_cleanup(app.state.pool, RUN_ID)
+        await runs.finish_cleanup(app.state.pool, RUN_ID)
         events = parse_sse((await asyncio.wait_for(response, 3)).text)
         assert events == [
             ("status", None, {"status": "running"}),
@@ -369,13 +406,13 @@ async def test_events_wait_for_cancellation_and_ignore_late_worker_messages(
 
 async def test_statuses_only_move_forward(api: httpx.AsyncClient) -> None:
     await seed_run()
-    await queries.set_failed(app.state.pool, RUN_ID, "runner", "island crashed")
-    await queries.advance_status(app.state.pool, RUN_ID, "done")
-    await queries.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
+    await runs.set_failed(app.state.pool, RUN_ID, "runner", "island crashed")
+    await runs.advance_status(app.state.pool, RUN_ID, "done")
+    await runs.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
 
-    run = await queries.get_run(app.state.pool, RUN_ID)
+    run = await runs.get_run(app.state.pool, RUN_ID)
     assert run is not None and run.status == "failed"
-    assert await queries.get_result_body(app.state.pool, RUN_ID) is None
+    assert await runs.get_result_body(app.state.pool, RUN_ID) is None
 
 
 async def test_health(api: httpx.AsyncClient) -> None:

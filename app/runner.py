@@ -30,7 +30,7 @@ async def _request(client: httpx.AsyncClient, method: str, path: str, **kwargs: 
     try:
         return await client.request(method, path, **kwargs)
     except httpx.HTTPError as e:
-        raise RunnerUnavailable(f"runner unreachable: {type(e).__name__}: {e}") from e
+        raise RunnerUnavailable(f"Runner unreachable: {type(e).__name__}: {e}") from e
 
 
 def _error_text(response: httpx.Response) -> str:
@@ -55,7 +55,7 @@ async def health(client: httpx.AsyncClient) -> bool:
 async def presets(client: httpx.AsyncClient) -> bytes:
     response = await _request(client, "GET", "/presets")
     if response.status_code != 200:
-        raise RunnerUnavailable(f"runner answered {response.status_code} to /presets")
+        raise RunnerUnavailable(f"Runner answered {response.status_code} to /presets")
     return response.content
 
 
@@ -65,7 +65,7 @@ async def start(client: httpx.AsyncClient, run_id: str, preset: str, overrides: 
         return RunnerStatus(state=response.json()["state"], error=None)
     if response.status_code == 422:
         raise RunnerRejected(_error_text(response))
-    raise RunnerUnavailable(f"runner answered {response.status_code} to the start: {_error_text(response)}")
+    raise RunnerUnavailable(f"Runner answered {response.status_code} to the start: {_error_text(response)}")
 
 
 async def status(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:
@@ -73,19 +73,14 @@ async def status(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:
     if response.status_code == 404:
         return RunnerStatus(state="unknown", error=None)
     if response.status_code != 200:
-        raise RunnerUnavailable(f"runner answered {response.status_code} to the status poll")
+        raise RunnerUnavailable(f"Runner answered {response.status_code} to the status poll")
     body = response.json()
     return RunnerStatus(state=body["state"], error=body.get("error"))
 
 
-async def cancel(client: httpx.AsyncClient, run_id: str) -> RunnerStatus:
+async def cancel(client: httpx.AsyncClient, run_id: str) -> None:
     response = await _request(client, "POST", f"/runs/{run_id}/cancel")
     if response.status_code == 404:
-        return RunnerStatus(state="unknown", error=None)
+        return
     if not response.is_success:
-        raise RunnerUnavailable(f"runner answered {response.status_code} to the cancel: {_error_text(response)}")
-    try:
-        body = response.json()
-        return RunnerStatus(state=body["state"], error=body.get("error"))
-    except (ValueError, KeyError, TypeError, AttributeError) as e:
-        raise RunnerUnavailable(f"runner gave an unreadable answer to the cancel: {response.text[:200]}") from e
+        raise RunnerUnavailable(f"Runner answered {response.status_code} to the cancel: {_error_text(response)}")
