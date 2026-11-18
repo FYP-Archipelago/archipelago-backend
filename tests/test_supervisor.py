@@ -17,7 +17,7 @@ from tests.conftest import FakeRunner
 
 pytestmark = pytest.mark.anyio
 
-BODY: dict[str, Any] = {"preset": "de-rastrigin", "overrides": {}, "stream": False, "clustering": {"lsh": True}}
+BODY: dict[str, Any] = {"run_name": "baseline", "preset": "de-rastrigin", "overrides": {}, "stream": False, "clustering": {"lsh": True}}
 
 
 async def create_run(api: httpx.AsyncClient, **body: Any) -> str:

@@ -17,7 +17,13 @@ from tests.conftest import FakeRunner
 
 pytestmark = pytest.mark.anyio
 
-BODY: dict[str, Any] = {"preset": "de-rastrigin", "overrides": {"num_islands": 4}, "stream": True, "clustering": {"lsh": True}}
+BODY: dict[str, Any] = {
+    "run_name": "baseline",
+    "preset": "de-rastrigin",
+    "overrides": {"num_islands": 4},
+    "stream": True,
+    "clustering": {"lsh": True},
+}
 RUN_ID = "run-20261027T000000Z-0123abcd"
 
 
@@ -59,6 +65,15 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
     assert Config.model_validate_json(job[b"config"]) == Config(lsh=True)
 
 
+async def test_create_run_stores_the_trimmed_run_name(api: httpx.AsyncClient) -> None:
+    r = await api.post("/runs", json={**BODY, "run_name": "  baseline  "})
+
+    assert r.status_code == 202
+    assert r.json()["run_name"] == "baseline"
+    run = await queries.get_run(app.state.pool, r.json()["run_id"])
+    assert run is not None and run.run_name == "baseline"
+
+
 async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:
     ids = [f"run-20261027T000000Z-{value:08x}" for value in range(1, 42)]
     for run_id in ids:
@@ -91,6 +106,7 @@ async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClien
     assert response.status_code == 200
     [run] = response.json()["runs"]
     assert run["run_id"] == RUN_ID and run["status"] == "failed"
+    assert run["run_name"] == BODY["run_name"]
     assert run["preset"] == BODY["preset"] and run["overrides"] == BODY["overrides"]
     assert run["stream"] is True and run["clustering"] == Config(lsh=True).model_dump(mode="json")
     assert run["error"] == {"phase": "clustering", "message": "boom"}
@@ -163,6 +179,8 @@ async def test_failed_start_gives_502_and_fails_the_run(
     [
         {**BODY, "clustering": {}},
         {**BODY, "unknown": 1},
+        {key: value for key, value in BODY.items() if key != "run_name"},
+        {**BODY, "run_name": "   "},
     ],
 )
 async def test_invalid_body_is_rejected_before_anything_happens(

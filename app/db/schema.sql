@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS runs (
     run_id text PRIMARY KEY,
+    run_name text NOT NULL,
     status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'clustering', 'done', 'failed', 'cancelling', 'cancelled')),
     stream boolean NOT NULL,
     preset text NOT NULL,
