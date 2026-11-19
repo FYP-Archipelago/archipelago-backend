@@ -166,6 +166,7 @@ async def test_failed_start_gives_502_and_fails_the_run(
     [
         {**BODY, "clustering": {}},
         {**BODY, "unknown": 1},
+        {**BODY, "runner_key": "unconfigured"},
     ],
 )
 async def test_invalid_body_is_rejected_before_anything_happens(

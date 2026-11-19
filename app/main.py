@@ -12,7 +12,7 @@ from app import __version__, runner
 from app.db import queries
 from app.redis_names import GROUP, PENDING_RUNS
 from app.routes import router
-from app.settings import DEFAULT_RUNNER_KEY, load_settings
+from app.settings import load_settings
 from app.supervisor import cancel_all, start_supervisor
 
 # one per open SSE viewer (each blocked XREAD holds a connection) and per supervisor, plus headroom
@@ -44,7 +44,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.pool = pool
         app.state.redis = redis
         app.state.runners = runners
-        app.state.runner = runners[DEFAULT_RUNNER_KEY]
         stack.push_async_callback(cancel_all)
 
         for run_id, runner_key in (await queries.list_unexpired(pool)).items():

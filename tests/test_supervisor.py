@@ -9,10 +9,12 @@ import httpx
 import pytest
 import redis
 
+from app import runner as runner_client
 from app import supervisor
 from app.db import queries
 from app.main import app
 from app.models import CreateRun
+from app.settings import load_settings
 from tests.conftest import FakeRunner
 
 pytestmark = pytest.mark.anyio
@@ -342,3 +344,49 @@ async def test_api_restart_reattaches_unfinished_runs(running_app: Callable[[], 
     async with running_app():
         await wait_for(lambda: streams_expired(run_id))
         assert await status_is(run_id, "done")
+
+
+async def test_two_runners_keep_their_runs_after_api_restart(
+    running_app: Callable[[], Any], runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    volpe = FakeRunner(
+        presets=httpx.Response(200, json={"overrides": {}, "presets": [{"preset": "volpe-preset"}]}),
+        health=httpx.Response(503),
+    )
+    submissions: dict[str, list[dict[str, Any]]] = {"runner": [], "volpe": []}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/runs":
+            submissions[request.url.host].append(json.loads(request.content))
+        return {"runner": runner, "volpe": volpe}[request.url.host].handle(request)
+
+    monkeypatch.setenv("ARCHIPELAGO_RUNNERS", '{"volpe":"http://volpe"}')
+    monkeypatch.setattr("app.main.settings", load_settings())
+    monkeypatch.setattr(runner_client, "make_client", lambda base_url: httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url=base_url))
+
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as api:
+        assert (await api.get("/runners")).json() == {"default": "dea", "runners": ["dea", "volpe"]}
+        assert (await api.get("/presets", params={"runner_key": "volpe"})).content == volpe.presets.content
+        assert (await api.get("/health")).json()["ready"] is True
+        assert (await api.get("/health", params={"runner_key": "volpe"})).json()["ready"] is False
+        volpe.health = httpx.Response(200, json={"status": "ok"})
+        dea_id = await create_run(api)
+        volpe_id = await create_run(api, runner_key="volpe", overrides={"volpe.image": "approved-image"})
+        assert (await api.get(f"/runs/{volpe_id}")).json()["runner_key"] == "volpe"
+        assert submissions == {
+            "runner": [{"run_id": dea_id, "preset": BODY["preset"], "overrides": {}}],
+            "volpe": [{"run_id": volpe_id, "preset": BODY["preset"], "overrides": {"volpe.image": "approved-image"}}],
+        }
+
+    runner.calls.clear()
+    volpe.calls.clear()
+    cancel_call = f"POST /runs/{volpe_id}/cancel"
+
+    async def correct_runners_contacted() -> bool:
+        return f"GET /runs/{dea_id}" in runner.calls and f"GET /runs/{volpe_id}" in volpe.calls and cancel_call in volpe.calls
+
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as api:
+        assert (await api.post(f"/runs/{volpe_id}/cancel")).status_code == 202
+        await wait_for(correct_runners_contacted)
+        assert all(dea_id in call for call in runner.calls)
+        assert all(volpe_id in call for call in volpe.calls)

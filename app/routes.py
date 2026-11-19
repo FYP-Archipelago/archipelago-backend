@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import psycopg
 from archipelago import Result
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -22,6 +23,7 @@ from app.ids import is_run_id, mint_run_id
 from app.models import CreateRun, RunPage, RunStatus, Status
 from app.redis_names import ERROR, FINAL, JOB_CONFIG, JOB_RUN_ID, JOB_STREAM, PENDING_RUNS, PHASE, UPDATE, clustered_key
 from app.runner import RunnerRejected, RunnerUnavailable
+from app.settings import DEFAULT_RUNNER_KEY
 from app.supervisor import start_supervisor, write_abort
 
 SSE_BLOCK_MS = 2000
@@ -31,6 +33,13 @@ RUNS_PAGE_SIZE = 20
 STREAM_ID = re.compile(r"^\d+-\d+$")
 
 router = APIRouter()
+
+
+def _get_runner(request: Request, runner_key: str) -> httpx.AsyncClient:
+    client = request.app.state.runners.get(runner_key)
+    if client is None:
+        raise HTTPException(422, f"unknown runner {runner_key!r}")
+    return client
 
 
 def _sse(event: str, data: bytes, event_id: bytes | None = None) -> bytes:
@@ -60,10 +69,16 @@ def _encode_cursor(run: RunStatus) -> str:
     return base64.urlsafe_b64encode(value.encode()).decode().rstrip("=")
 
 
+@router.get("/runners")
+async def list_runners(request: Request) -> dict[str, str | list[str]]:
+    return {"default": DEFAULT_RUNNER_KEY, "runners": list(request.app.state.runners)}
+
+
 @router.get("/presets")
-async def get_presets(request: Request) -> Response:
+async def get_presets(request: Request, runner_key: str = DEFAULT_RUNNER_KEY) -> Response:
+    client = _get_runner(request, runner_key)
     try:
-        body = await runner.presets(request.app.state.runner)
+        body = await runner.presets(client)
     except RunnerUnavailable as e:
         raise HTTPException(502, str(e)) from e
     return Response(body, media_type="application/json")
@@ -73,6 +88,7 @@ async def get_presets(request: Request) -> Response:
 async def create_run(body: CreateRun, request: Request) -> RunStatus:
     state: Any = request.app.state
     redis: Redis = state.redis
+    client = _get_runner(request, body.runner_key)
     run = await queries.insert_run(state.pool, mint_run_id(), body)
     # enqueue before starting the runner: if the API dies in between, what's left is a waiting job
     # that recovery cleans up, not an EA running with logs that never expire
@@ -81,23 +97,23 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
         {JOB_RUN_ID: run.run_id, JOB_STREAM: "true" if run.stream else "false", JOB_CONFIG: run.clustering.model_dump_json()},
     )
     try:
-        started = await runner.start(state.runner, run.run_id, run.preset, run.overrides)
+        started = await runner.start(client, run.run_id, run.preset, run.overrides)
     except RunnerRejected as e:
         await queries.set_failed(state.pool, run.run_id, "runner", str(e))
         # a worker may already hold the job, and the abort makes it let go
         await write_abort(redis, run.run_id, str(e))
-        start_supervisor(run.run_id, state.pool, redis, state.runner, runner_done=True, abort_sent=True)
+        start_supervisor(run.run_id, state.pool, redis, client, runner_done=True, abort_sent=True)
         raise HTTPException(422, str(e)) from e
     except RunnerUnavailable as e:
         await queries.set_failed(state.pool, run.run_id, "runner", str(e))
         await write_abort(redis, run.run_id, str(e))
         # the start may have reached the runner before the error, so the supervisor still polls and cancels it
-        start_supervisor(run.run_id, state.pool, redis, state.runner, abort_sent=True)
+        start_supervisor(run.run_id, state.pool, redis, client, abort_sent=True)
         raise HTTPException(502, str(e)) from e
     if started.state == "running":
         await queries.advance_status(state.pool, run.run_id, "running")
         run = run.model_copy(update={"status": "running"})
-    start_supervisor(run.run_id, state.pool, redis, state.runner)
+    start_supervisor(run.run_id, state.pool, redis, client)
     return run
 
 
@@ -131,6 +147,8 @@ async def cancel_run(run_id: str, request: Request, response: Response) -> RunSt
         raise HTTPException(404, "run not found")
     if run.status in ("done", "failed", "cancelled"):
         return run
+    if run.runner_key not in state.runners:
+        raise HTTPException(503, f"runner {run.runner_key!r} is not configured")
     if run.status != "cancelling":
         await queries.set_cancelling(state.pool, run_id)
     updated = await queries.get_run(state.pool, run_id) or run
@@ -240,8 +258,9 @@ async def run_result(run_id: str, request: Request) -> Response:
 
 
 @router.get("/health")
-async def health(request: Request) -> JSONResponse:
+async def health(request: Request, runner_key: str = DEFAULT_RUNNER_KEY) -> JSONResponse:
     state: Any = request.app.state
+    client = _get_runner(request, runner_key)
 
     async def check_db() -> bool:
         try:
@@ -262,7 +281,7 @@ async def health(request: Request) -> JSONResponse:
     async def check_runner() -> bool:
         try:
             async with asyncio.timeout(2):
-                return await runner.health(state.runner)
+                return await runner.health(client)
         except (TimeoutError, RunnerUnavailable):
             return False
 
