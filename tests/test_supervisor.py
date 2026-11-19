@@ -390,3 +390,82 @@ async def test_two_runners_keep_their_runs_after_api_restart(
         await wait_for(correct_runners_contacted)
         assert all(dea_id in call for call in runner.calls)
         assert all(volpe_id in call for call in volpe.calls)
+
+
+@pytest.mark.parametrize("final_before_restart", [True, False])
+async def test_recovery_with_removed_runner_saves_final_without_contacting_default(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, final_before_restart: bool
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d0"
+    final = '{"graph":{"nodes":[7]}}'
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.advance_status(app.state.pool, run_id, "running")
+
+    if final_before_restart:
+        finish_job(sync_redis, run_id, final=final)
+
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as restarted:
+        if not final_before_restart:
+            assert (await restarted.post(f"/runs/{run_id}/cancel")).status_code == 503
+            assert await status_is(run_id, "running")
+            finish_job(sync_redis, run_id, final=final)
+
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "done")
+        result = await restarted.get(f"/runs/{run_id}/result")
+        assert result.status_code == 200 and result.text == final
+        assert runner.calls == []
+        assert 0 < sync_redis.ttl(f"run:{run_id}:clustered") <= supervisor.STREAM_TTL_SECONDS
+
+
+async def test_final_settles_prior_cancellation_when_owner_is_removed(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d1"
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.set_cancelling(app.state.pool, run_id)
+
+    finish_job(sync_redis, run_id, final='{"graph":{"nodes":[7]}}')
+    async with running_app():
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "cancelled")
+        assert await queries.get_result_body(app.state.pool, run_id) is None
+        assert runner.calls == []
+
+
+@pytest.mark.parametrize("terminal_before_restart", [True, False])
+async def test_aborted_run_cleans_up_when_owner_is_removed(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, terminal_before_restart: bool
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d2"
+    log_key = f"run:{run_id}:runner_logs"
+    clustered_key = f"run:{run_id}:clustered"
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.set_cancelling(app.state.pool, run_id)
+
+    def finish_runner() -> None:
+        sync_redis.xadd(log_key, {"kind": "event", "data": '{"type":"run_end","termination_reason":"aborted"}'})
+        # More than one page of backend markers exercises the tail search.
+        for _ in range(supervisor.RUNNER_TAIL_PAGE_SIZE + 1):
+            sync_redis.xadd(log_key, {"kind": "abort", "data": '{"error":"run cancelled"}'})
+
+    sync_redis.xadd(log_key, {"kind": "event", "data": '{"type":"run_start"}'})
+    finish_job(sync_redis, run_id, phase="runner", error="run cancelled")
+    if terminal_before_restart:
+        finish_runner()
+
+    async with running_app():
+        if not terminal_before_restart:
+            # Wait for the supervisor to inspect the pre-terminal stream.
+            await anyio.sleep(0.3)
+            assert await status_is(run_id, "cancelling")
+            assert sync_redis.ttl(log_key) == sync_redis.ttl(clustered_key) == -1
+            finish_runner()
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "cancelled")
+        assert 0 < sync_redis.ttl(log_key) <= supervisor.STREAM_TTL_SECONDS
+        assert 0 < sync_redis.ttl(clustered_key) <= supervisor.STREAM_TTL_SECONDS
+        assert runner.calls == []

@@ -49,8 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         for run_id, runner_key in (await queries.list_unexpired(pool)).items():
             client = runners.get(runner_key)
             if client is None:
-                logger.warning("runner %r for run %s is not configured", runner_key, run_id)
-                continue
+                logger.warning("recovering clustered output for %s: runner %r is not configured", run_id, runner_key)
             start_supervisor(run_id, pool, redis, client)
 
         yield

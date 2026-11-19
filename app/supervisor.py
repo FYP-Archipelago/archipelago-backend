@@ -13,7 +13,7 @@ from redis.asyncio import Redis
 from app import runner
 from app.db import queries
 from app.models import Phase
-from app.redis_names import ABORT, DATA, ERROR, FINAL, JOB_RUN_ID, KIND, PENDING_RUNS, PHASE, clustered_key, runner_logs_key
+from app.redis_names import ABORT, DATA, ERROR, EVENT, FINAL, JOB_RUN_ID, KIND, PENDING_RUNS, PHASE, clustered_key, runner_logs_key
 from app.runner import RunnerUnavailable
 
 POLL_SECONDS = 2
@@ -22,6 +22,7 @@ STREAM_TTL_SECONDS = 60
 MAX_ERRORS = 3
 ERROR_RETRY_SECONDS = 5
 PENDING_SCAN_PAGE_SIZE = 100
+RUNNER_TAIL_PAGE_SIZE = 32
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ class _RunState:
     run_id: str
     pool: AsyncConnectionPool
     redis: Redis
-    client: httpx.AsyncClient
+    client: httpx.AsyncClient | None
     runner_done: bool
     abort_sent: bool
     worker_done: bool = False
@@ -47,7 +48,7 @@ def start_supervisor(
     run_id: str,
     pool: AsyncConnectionPool,
     redis: Redis,
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient | None,
     *,
     runner_done: bool = False,
     abort_sent: bool = False,
@@ -77,8 +78,8 @@ async def _supervise(state: _RunState) -> None:
         try:
             await _read_clustered(state)
             polled_runner = False
-            if not state.runner_done and time.monotonic() - state.last_poll >= POLL_SECONDS:
-                await _poll_runner(state)
+            if state.client is not None and not state.runner_done and time.monotonic() - state.last_poll >= POLL_SECONDS:
+                await _poll_runner(state, state.client)
                 polled_runner = True
 
             run = await queries.get_run(state.pool, state.run_id)
@@ -87,6 +88,11 @@ async def _supervise(state: _RunState) -> None:
             # a done run's result is saved, even if its streams expired before the API last stopped
             if run.status == "done":
                 state.worker_done = True
+                if state.client is None:
+                    # A final graph is produced only after the worker reads a normal run_end.
+                    state.runner_done = True
+            if state.client is None and not state.runner_done and (state.worker_done or run.status == "cancelling"):
+                state.runner_done = await _runner_stream_ended(state)
             if run.status in ("failed", "cancelling", "cancelled"):
                 if run.status == "cancelling" and polled_runner and not state.runner_done:
                     state.cancel_sent = False
@@ -126,6 +132,9 @@ async def _read_clustered(state: _RunState) -> None:
                     body = await asyncio.to_thread(gzip.compress, fields[FINAL])
                     await queries.save_result(state.pool, state.run_id, body)
                 state.worker_done = True
+                if state.client is None:
+                    # A final graph confirms the worker read a normal run_end.
+                    state.runner_done = True
             elif PHASE in fields and ERROR in fields:
                 await queries.set_failed(state.pool, state.run_id, cast(Phase, fields[PHASE].decode()), fields[ERROR].decode())
                 state.worker_done = True
@@ -133,11 +142,30 @@ async def _read_clustered(state: _RunState) -> None:
             state.last_id = entry_id.decode()
 
 
-async def _poll_runner(state: _RunState) -> None:
+async def _runner_stream_ended(state: _RunState) -> bool:
+    # Read the last runner record. Backend abort markers can be appended after run_end.
+    cursor = b"+"
+    while entries := await state.redis.xrevrange(runner_logs_key(state.run_id), max=cursor, count=RUNNER_TAIL_PAGE_SIZE):
+        for _, fields in entries:
+            kind = fields.get(KIND)
+            if kind == ABORT:
+                continue
+            if kind != EVENT:
+                return False
+            try:
+                record = json.loads(fields[DATA])
+            except (KeyError, ValueError):
+                return False
+            return isinstance(record, dict) and record.get("type") == "run_end"
+        cursor = b"(" + entries[-1][0]
+    return False
+
+
+async def _poll_runner(state: _RunState, client: httpx.AsyncClient) -> None:
     now = time.monotonic()
     state.last_poll = now
     try:
-        polled = await runner.status(state.client, state.run_id)
+        polled = await runner.status(client, state.run_id)
     except RunnerUnavailable as e:
         state.first_failed_poll = state.first_failed_poll or now
         logger.warning("polling the runner for %s failed: %s", state.run_id, e)
@@ -174,7 +202,7 @@ async def _request_run_shutdown(state: _RunState, message: str) -> None:
     if not state.worker_done and not state.abort_sent:
         await write_abort(state.redis, state.run_id, message)
         state.abort_sent = True
-    if not state.runner_done and not state.cancel_sent:
+    if state.client is not None and not state.runner_done and not state.cancel_sent:
         try:
             await runner.cancel(state.client, state.run_id)
         except RunnerUnavailable as e:
