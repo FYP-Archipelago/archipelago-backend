@@ -24,6 +24,7 @@ class RunError(BaseModel):
 
 class RunStatus(BaseModel):
     run_id: str
+    runner_key: str
     status: Status
     stream: bool
     preset: str

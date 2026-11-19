@@ -28,6 +28,7 @@ def _to_run_status(row: dict[str, Any]) -> RunStatus:
     error = RunError(phase=row["error_phase"], message=row["error_message"]) if row["error_phase"] else None
     return RunStatus(
         run_id=row["run_id"],
+        runner_key=row["runner_key"],
         status=row["status"],
         stream=row["stream"],
         preset=row["preset"],
