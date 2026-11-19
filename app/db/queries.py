@@ -126,10 +126,10 @@ async def finish_cleanup(pool: AsyncConnectionPool, run_id: str) -> None:
         )
 
 
-async def list_unexpired(pool: AsyncConnectionPool) -> list[str]:
+async def list_unexpired(pool: AsyncConnectionPool) -> dict[str, str]:
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT run_id FROM runs WHERE NOT streams_expired")
-        return [row["run_id"] for row in await cur.fetchall()]
+        cur = await conn.execute("SELECT run_id, runner_key FROM runs WHERE NOT streams_expired")
+        return {row["run_id"]: row["runner_key"] for row in await cur.fetchall()}
 
 
 async def get_result_body(pool: AsyncConnectionPool, run_id: str) -> bytes | None:

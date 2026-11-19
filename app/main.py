@@ -19,6 +19,7 @@ from app.supervisor import cancel_all, start_supervisor
 REDIS_MAX_CONNECTIONS = 200
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 settings = load_settings()
 
@@ -46,8 +47,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.runner = runners[DEFAULT_RUNNER_KEY]
         stack.push_async_callback(cancel_all)
 
-        for run_id in await queries.list_unexpired(pool):
-            start_supervisor(run_id, pool, redis, app.state.runner)
+        for run_id, runner_key in (await queries.list_unexpired(pool)).items():
+            client = runners.get(runner_key)
+            if client is None:
+                logger.warning("runner %r for run %s is not configured", runner_key, run_id)
+                continue
+            start_supervisor(run_id, pool, redis, client)
 
         yield
 
