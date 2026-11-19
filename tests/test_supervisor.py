@@ -9,10 +9,12 @@ import httpx
 import pytest
 import redis
 
+from app import runner as runner_client
 from app import supervisor
 from app.db import queries
 from app.main import app
 from app.models import CreateRun
+from app.settings import load_settings
 from tests.conftest import FakeRunner
 
 pytestmark = pytest.mark.anyio
@@ -342,3 +344,159 @@ async def test_api_restart_reattaches_unfinished_runs(running_app: Callable[[], 
     async with running_app():
         await wait_for(lambda: streams_expired(run_id))
         assert await status_is(run_id, "done")
+
+
+async def test_two_runners_keep_their_runs_after_api_restart(
+    running_app: Callable[[], Any], runner: FakeRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    volpe = FakeRunner(
+        presets=httpx.Response(200, json={"overrides": {}, "presets": [{"preset": "volpe-preset"}]}),
+        health=httpx.Response(503),
+    )
+    submissions: dict[str, list[dict[str, Any]]] = {"runner": [], "volpe": []}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/runs":
+            submissions[request.url.host].append(json.loads(request.content))
+        return {"runner": runner, "volpe": volpe}[request.url.host].handle(request)
+
+    monkeypatch.setenv("ARCHIPELAGO_RUNNERS", '{"volpe":"http://volpe"}')
+    monkeypatch.setattr("app.main.settings", load_settings())
+    monkeypatch.setattr(runner_client, "make_client", lambda base_url: httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url=base_url))
+
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as api:
+        assert (await api.get("/runners")).json() == {"default": "dea", "runners": ["dea", "volpe"]}
+        assert (await api.get("/presets", params={"runner_key": "volpe"})).content == volpe.presets.content
+        assert (await api.get("/health")).json()["ready"] is True
+        assert (await api.get("/health", params={"runner_key": "volpe"})).json()["ready"] is False
+        volpe.health = httpx.Response(200, json={"status": "ok"})
+        dea_id = await create_run(api)
+        volpe_id = await create_run(api, runner_key="volpe", overrides={"volpe.image": "approved-image"})
+        assert (await api.get(f"/runs/{volpe_id}")).json()["runner_key"] == "volpe"
+        assert submissions == {
+            "runner": [{"run_id": dea_id, "preset": BODY["preset"], "overrides": {}}],
+            "volpe": [{"run_id": volpe_id, "preset": BODY["preset"], "overrides": {"volpe.image": "approved-image"}}],
+        }
+
+    runner.calls.clear()
+    volpe.calls.clear()
+    cancel_call = f"POST /runs/{volpe_id}/cancel"
+
+    async def correct_runners_contacted() -> bool:
+        return f"GET /runs/{dea_id}" in runner.calls and f"GET /runs/{volpe_id}" in volpe.calls and cancel_call in volpe.calls
+
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as api:
+        assert (await api.post(f"/runs/{volpe_id}/cancel")).status_code == 202
+        await wait_for(correct_runners_contacted)
+        assert all(dea_id in call for call in runner.calls)
+        assert all(volpe_id in call for call in volpe.calls)
+
+
+@pytest.mark.parametrize("final_before_restart", [True, False])
+async def test_recovery_with_removed_runner_saves_final_without_contacting_default(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, final_before_restart: bool
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d0"
+    final = '{"graph":{"nodes":[7]}}'
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.advance_status(app.state.pool, run_id, "running")
+
+    if final_before_restart:
+        finish_job(sync_redis, run_id, final=final)
+
+    async with running_app(), httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://api") as restarted:
+        if not final_before_restart:
+            assert (await restarted.post(f"/runs/{run_id}/cancel")).status_code == 503
+            assert await status_is(run_id, "running")
+            finish_job(sync_redis, run_id, final=final)
+
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "done")
+        result = await restarted.get(f"/runs/{run_id}/result")
+        assert result.status_code == 200 and result.text == final
+        assert runner.calls == []
+        assert 0 < sync_redis.ttl(f"run:{run_id}:clustered") <= supervisor.STREAM_TTL_SECONDS
+
+
+async def test_final_settles_prior_cancellation_when_owner_is_removed(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d1"
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.set_cancelling(app.state.pool, run_id)
+
+    finish_job(sync_redis, run_id, final='{"graph":{"nodes":[7]}}')
+    async with running_app():
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "cancelled")
+        assert await queries.get_result_body(app.state.pool, run_id) is None
+        assert runner.calls == []
+
+
+@pytest.mark.parametrize("terminal_before_restart", [True, False])
+async def test_aborted_run_cleans_up_when_owner_is_removed(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, terminal_before_restart: bool
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d2"
+    log_key = f"run:{run_id}:runner_logs"
+    clustered_key = f"run:{run_id}:clustered"
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.set_cancelling(app.state.pool, run_id)
+
+    def finish_runner() -> None:
+        sync_redis.xadd(log_key, {"kind": "event", "data": '{"type":"run_end","termination_reason":"aborted"}'})
+        # More than one page of backend markers exercises the tail search.
+        for _ in range(supervisor.RUNNER_TAIL_PAGE_SIZE + 1):
+            sync_redis.xadd(log_key, {"kind": "abort", "data": '{"error":"run cancelled"}'})
+
+    sync_redis.xadd(log_key, {"kind": "event", "data": '{"type":"run_start"}'})
+    finish_job(sync_redis, run_id, phase="runner", error="run cancelled")
+    if terminal_before_restart:
+        finish_runner()
+
+    async with running_app():
+        if not terminal_before_restart:
+            # Wait for the supervisor to inspect the pre-terminal stream.
+            await anyio.sleep(0.3)
+            assert await status_is(run_id, "cancelling")
+            assert sync_redis.ttl(log_key) == sync_redis.ttl(clustered_key) == -1
+            finish_runner()
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "cancelled")
+        assert 0 < sync_redis.ttl(log_key) <= supervisor.STREAM_TTL_SECONDS
+        assert 0 < sync_redis.ttl(clustered_key) <= supervisor.STREAM_TTL_SECONDS
+        assert runner.calls == []
+
+
+@pytest.mark.parametrize("confirmed_before_restart", [True, False])
+async def test_queued_cancellation_uses_volpe_journal_after_runner_removed(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, confirmed_before_restart: bool
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d3"
+    log_key = f"run:{run_id}:runner_logs"
+    clustered_key = f"run:{run_id}:clustered"
+    journal_key = f"volpe:runner:run:{run_id}"
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.set_cancelling(app.state.pool, run_id)
+
+    sync_redis.xadd(log_key, {"kind": "abort", "data": '{"error":"run cancelled"}'})
+    finish_job(sync_redis, run_id, phase="runner", error="run cancelled")
+    sync_redis.hset(journal_key, "state", "cancelled" if confirmed_before_restart else "queued")
+
+    async with running_app():
+        if not confirmed_before_restart:
+            await anyio.sleep(0.3)
+            assert await status_is(run_id, "cancelling")
+            assert sync_redis.ttl(log_key) == sync_redis.ttl(clustered_key) == -1
+            sync_redis.hset(journal_key, "state", "cancelled")
+
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "cancelled")
+        assert all(fields[b"kind"] == b"abort" for _, fields in sync_redis.xrange(log_key))
+        assert 0 < sync_redis.ttl(log_key) <= supervisor.STREAM_TTL_SECONDS
+        assert 0 < sync_redis.ttl(clustered_key) <= supervisor.STREAM_TTL_SECONDS
+        assert runner.calls == []

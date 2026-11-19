@@ -4,6 +4,8 @@ from typing import Any, Literal
 from archipelago import Config
 from pydantic import BaseModel, ConfigDict
 
+from app.settings import DEFAULT_RUNNER_KEY
+
 Status = Literal["queued", "running", "clustering", "done", "failed", "cancelling", "cancelled"]
 Phase = Literal["runner", "clustering", "internal"]
 
@@ -11,6 +13,7 @@ Phase = Literal["runner", "clustering", "internal"]
 class CreateRun(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    runner_key: str = DEFAULT_RUNNER_KEY
     preset: str
     overrides: dict[str, Any] = {}
     stream: bool = False
@@ -24,6 +27,7 @@ class RunError(BaseModel):
 
 class RunStatus(BaseModel):
     run_id: str
+    runner_key: str
     status: Status
     stream: bool
     preset: str

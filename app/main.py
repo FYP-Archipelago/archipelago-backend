@@ -1,6 +1,6 @@
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,35 +19,40 @@ from app.supervisor import cancel_all, start_supervisor
 REDIS_MAX_CONNECTIONS = 200
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 settings = load_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    pool = await queries.open_pool(settings.database_url)
-    await queries.apply_schema(pool)
-    # a pooled connection that died (e.g. Redis restarted) is reopened and the command retried once
-    redis = Redis.from_url(settings.redis_url, decode_responses=False, max_connections=REDIS_MAX_CONNECTIONS, retry_on_error=[RedisConnectionError])
-    try:
-        await redis.xgroup_create(PENDING_RUNS, GROUP, id="0", mkstream=True)
-    except ResponseError as e:
-        if "BUSYGROUP" not in str(e):
-            raise
-    client = runner.make_client(settings.runner_url)
-    app.state.pool = pool
-    app.state.redis = redis
-    app.state.runner = client
+    async with AsyncExitStack() as stack:
+        pool = await queries.open_pool(settings.database_url)
+        stack.push_async_callback(pool.close)
+        await queries.apply_schema(pool)
+        # a pooled connection that died (e.g. Redis restarted) is reopened and the command retried once
+        redis = Redis.from_url(
+            settings.redis_url, decode_responses=False, max_connections=REDIS_MAX_CONNECTIONS, retry_on_error=[RedisConnectionError]
+        )
+        stack.push_async_callback(redis.aclose)
+        try:
+            await redis.xgroup_create(PENDING_RUNS, GROUP, id="0", mkstream=True)
+        except ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+        runners = {key: await stack.enter_async_context(runner.make_client(url)) for key, url in settings.runner_urls.items()}
+        app.state.pool = pool
+        app.state.redis = redis
+        app.state.runners = runners
+        stack.push_async_callback(cancel_all)
 
-    for run_id in await queries.list_unexpired(pool):
-        start_supervisor(run_id, pool, redis, client)
+        for run_id, runner_key in (await queries.list_unexpired(pool)).items():
+            client = runners.get(runner_key)
+            if client is None:
+                logger.warning("recovering clustered output for %s: runner %r is not configured", run_id, runner_key)
+            start_supervisor(run_id, pool, redis, client)
 
-    yield
-
-    await cancel_all()
-    await client.aclose()
-    await redis.aclose()
-    await pool.close()
+        yield
 
 
 app = FastAPI(title="archipelago-backend", version=__version__, lifespan=lifespan)

@@ -1,6 +1,8 @@
 import asyncio
 import gzip
 import json
+import os
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -51,6 +53,7 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
     assert r.status_code == 202
     run = r.json()
     assert run["status"] == "running"
+    assert run["runner_key"] == "dea"
     assert run["clustering"] == Config(lsh=True).model_dump(mode="json")
     assert jobs_at_start == [1]
     [(_, job)] = sync_redis.xrange("pending_runs")
@@ -163,6 +166,7 @@ async def test_failed_start_gives_502_and_fails_the_run(
     [
         {**BODY, "clustering": {}},
         {**BODY, "unknown": 1},
+        {**BODY, "runner_key": "unconfigured"},
     ],
 )
 async def test_invalid_body_is_rejected_before_anything_happens(
@@ -173,6 +177,20 @@ async def test_invalid_body_is_rejected_before_anything_happens(
     assert r.status_code == 422
     assert sync_redis.xlen("pending_runs") == 0
     assert runner.calls == []
+
+
+async def test_schema_migrates_legacy_runs_to_dea(running_app: Callable[[], Any]) -> None:
+    with psycopg.connect(os.environ["ARCHIPELAGO_DATABASE_URL"]) as conn:
+        conn.execute("ALTER TABLE runs DROP COLUMN runner_key")
+        conn.execute(
+            "INSERT INTO runs (run_id, stream, preset, clustering, streams_expired) VALUES (%s, false, 'legacy', %s::jsonb, true)",
+            (RUN_ID, Config(lsh=True).model_dump_json()),
+        )
+
+    for _ in range(2):
+        async with running_app():
+            run = await queries.get_run(app.state.pool, RUN_ID)
+            assert run is not None and run.runner_key == "dea" and run.preset == "legacy"
 
 
 async def test_presets_are_forwarded_byte_for_byte(api: httpx.AsyncClient, runner: FakeRunner) -> None:

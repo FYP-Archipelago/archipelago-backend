@@ -28,6 +28,7 @@ def _to_run_status(row: dict[str, Any]) -> RunStatus:
     error = RunError(phase=row["error_phase"], message=row["error_message"]) if row["error_phase"] else None
     return RunStatus(
         run_id=row["run_id"],
+        runner_key=row["runner_key"],
         status=row["status"],
         stream=row["stream"],
         preset=row["preset"],
@@ -42,8 +43,8 @@ def _to_run_status(row: dict[str, Any]) -> RunStatus:
 async def insert_run(pool: AsyncConnectionPool, run_id: str, body: CreateRun) -> RunStatus:
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "INSERT INTO runs (run_id, stream, preset, overrides, clustering) VALUES (%s, %s, %s, %s, %s) RETURNING *",
-            (run_id, body.stream, body.preset, Jsonb(body.overrides), Jsonb(body.clustering.model_dump(mode="json"))),
+            "INSERT INTO runs (run_id, runner_key, stream, preset, overrides, clustering) VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+            (run_id, body.runner_key, body.stream, body.preset, Jsonb(body.overrides), Jsonb(body.clustering.model_dump(mode="json"))),
         )
         row = await cur.fetchone()
     assert row is not None
@@ -125,10 +126,10 @@ async def finish_cleanup(pool: AsyncConnectionPool, run_id: str) -> None:
         )
 
 
-async def list_unexpired(pool: AsyncConnectionPool) -> list[str]:
+async def list_unexpired(pool: AsyncConnectionPool) -> dict[str, str]:
     async with pool.connection() as conn:
-        cur = await conn.execute("SELECT run_id FROM runs WHERE NOT streams_expired")
-        return [row["run_id"] for row in await cur.fetchall()]
+        cur = await conn.execute("SELECT run_id, runner_key FROM runs WHERE NOT streams_expired")
+        return {row["run_id"]: row["runner_key"] for row in await cur.fetchall()}
 
 
 async def get_result_body(pool: AsyncConnectionPool, run_id: str) -> bytes | None:
