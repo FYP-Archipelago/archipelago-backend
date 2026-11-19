@@ -469,3 +469,34 @@ async def test_aborted_run_cleans_up_when_owner_is_removed(
         assert 0 < sync_redis.ttl(log_key) <= supervisor.STREAM_TTL_SECONDS
         assert 0 < sync_redis.ttl(clustered_key) <= supervisor.STREAM_TTL_SECONDS
         assert runner.calls == []
+
+
+@pytest.mark.parametrize("confirmed_before_restart", [True, False])
+async def test_queued_cancellation_uses_volpe_journal_after_runner_removed(
+    running_app: Callable[[], Any], runner: FakeRunner, sync_redis: redis.Redis, confirmed_before_restart: bool
+) -> None:
+    run_id = "run-20261027T000000Z-d0d0d0d3"
+    log_key = f"run:{run_id}:runner_logs"
+    clustered_key = f"run:{run_id}:clustered"
+    journal_key = f"volpe:runner:run:{run_id}"
+    async with running_app():
+        await queries.insert_run(app.state.pool, run_id, CreateRun.model_validate({**BODY, "runner_key": "volpe"}))
+        await queries.set_cancelling(app.state.pool, run_id)
+
+    sync_redis.xadd(log_key, {"kind": "abort", "data": '{"error":"run cancelled"}'})
+    finish_job(sync_redis, run_id, phase="runner", error="run cancelled")
+    sync_redis.hset(journal_key, "state", "cancelled" if confirmed_before_restart else "queued")
+
+    async with running_app():
+        if not confirmed_before_restart:
+            await anyio.sleep(0.3)
+            assert await status_is(run_id, "cancelling")
+            assert sync_redis.ttl(log_key) == sync_redis.ttl(clustered_key) == -1
+            sync_redis.hset(journal_key, "state", "cancelled")
+
+        await wait_for(lambda: streams_expired(run_id))
+        assert await status_is(run_id, "cancelled")
+        assert all(fields[b"kind"] == b"abort" for _, fields in sync_redis.xrange(log_key))
+        assert 0 < sync_redis.ttl(log_key) <= supervisor.STREAM_TTL_SECONDS
+        assert 0 < sync_redis.ttl(clustered_key) <= supervisor.STREAM_TTL_SECONDS
+        assert runner.calls == []

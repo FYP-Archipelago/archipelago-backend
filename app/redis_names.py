@@ -27,3 +27,7 @@ def runner_logs_key(run_id: str) -> str:
 
 def clustered_key(run_id: str) -> str:
     return f"run:{run_id}:clustered"
+
+
+def volpe_run_key(run_id: str) -> str:
+    return f"volpe:runner:run:{run_id}"

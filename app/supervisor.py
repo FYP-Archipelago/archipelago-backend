@@ -13,7 +13,7 @@ from redis.asyncio import Redis
 from app import runner
 from app.db import queries
 from app.models import Phase
-from app.redis_names import ABORT, DATA, ERROR, EVENT, FINAL, JOB_RUN_ID, KIND, PENDING_RUNS, PHASE, clustered_key, runner_logs_key
+from app.redis_names import ABORT, DATA, ERROR, EVENT, FINAL, JOB_RUN_ID, KIND, PENDING_RUNS, PHASE, clustered_key, runner_logs_key, volpe_run_key
 from app.runner import RunnerUnavailable
 
 POLL_SECONDS = 2
@@ -93,6 +93,9 @@ async def _supervise(state: _RunState) -> None:
                     state.runner_done = True
             if state.client is None and not state.runner_done and (state.worker_done or run.status == "cancelling"):
                 state.runner_done = await _runner_stream_ended(state)
+                if not state.runner_done and run.status == "cancelling" and run.runner_key == "volpe":
+                    # VolPE records queued cancellations in its journal without writing runner events.
+                    state.runner_done = await state.redis.hget(volpe_run_key(state.run_id), "state") == b"cancelled"
             if run.status in ("failed", "cancelling", "cancelled"):
                 if run.status == "cancelling" and polled_runner and not state.runner_done:
                     state.cancel_sent = False
