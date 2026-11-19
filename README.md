@@ -43,6 +43,17 @@ This is the backend for Archipelago. It starts runs on the runner service, hands
    docker compose --profile dev up -d --build
    ```
 
+## Runner configuration
+
+`ARCHIPELAGO_RUNNER_URL` configures the default dEA runner. To register another deployment that implements the same runner API, set
+`ARCHIPELAGO_RUNNERS` to a JSON object such as `{"volpe":"http://volpe-adapter:9000"}`.
+
+`GET /runners` lists the configured keys and the default. Use `?runner_key=volpe` on `GET /presets` and `GET /health` to select a runner,
+and include `"runner_key": "volpe"` in `POST /runs` to start a run there. Omitting the key selects dEA. Keep a key pointed at the same
+deployment while it owns unfinished runs so status checks, cancellation, and startup recovery can still reach them.
+When the `volpe` registration is removed, the backend can still settle a confirmed cancellation from the terminal runner record
+or from VolPE's shared Redis journal while that record is retained.
+
 ## Tests
 
 1. The tests require Postgres and Redis to be running:
