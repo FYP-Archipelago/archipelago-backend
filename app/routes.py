@@ -81,7 +81,7 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
         {JOB_RUN_ID: run.run_id, JOB_STREAM: "true" if run.stream else "false", JOB_CONFIG: run.clustering.model_dump_json()},
     )
     try:
-        started = await runner.start(state.runner, run.run_id, run.preset, run.overrides)
+        started = await runner.start(state.runner, run.run_id, run.preset, run.run_settings)
     except RunnerRejected as e:
         await queries.set_failed(state.pool, run.run_id, "runner", str(e))
         # a worker may already hold the job, and the abort makes it let go

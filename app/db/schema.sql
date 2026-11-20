@@ -1,15 +1,18 @@
 CREATE TABLE IF NOT EXISTS runs (
     run_id text PRIMARY KEY,
+    run_name text NOT NULL,
     status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'clustering', 'done', 'failed', 'cancelling', 'cancelled')),
     stream boolean NOT NULL,
     preset text NOT NULL,
-    overrides jsonb NOT NULL DEFAULT '{}',
+    run_settings jsonb NOT NULL,
     clustering jsonb NOT NULL,
     error_phase text CHECK (error_phase IN ('runner', 'clustering', 'internal')),
     error_message text,
     streams_expired boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    finished_at timestamptz,
     CHECK ((status = 'failed') = (error_phase IS NOT NULL))
 );
 
