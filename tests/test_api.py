@@ -407,6 +407,32 @@ async def test_statuses_only_move_forward(api: httpx.AsyncClient) -> None:
     assert await queries.get_result_body(app.state.pool, RUN_ID) is None
 
 
+async def test_records_when_a_run_starts_and_finishes(api: httpx.AsyncClient) -> None:
+    await seed_run()
+    queued = (await api.get(f"/runs/{RUN_ID}")).json()
+    assert queued["started_at"] is None and queued["finished_at"] is None
+
+    await queries.advance_status(app.state.pool, RUN_ID, "running")
+    started = (await api.get(f"/runs/{RUN_ID}")).json()["started_at"]
+    await queries.advance_status(app.state.pool, RUN_ID, "clustering")
+    clustering = (await api.get(f"/runs/{RUN_ID}")).json()
+    assert started is not None and clustering["started_at"] == started and clustering["finished_at"] is None
+
+    await queries.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
+    done = (await api.get(f"/runs/{RUN_ID}")).json()
+    assert done["started_at"] == started and done["finished_at"] >= started
+
+
+async def test_a_cancelled_run_finishes_when_it_stops_not_when_asked(api: httpx.AsyncClient) -> None:
+    await seed_run("cancelling")
+    cancelling = await queries.get_run(app.state.pool, RUN_ID)
+    assert cancelling is not None and cancelling.finished_at is None
+
+    await queries.finish_cleanup(app.state.pool, RUN_ID)
+    run = await queries.get_run(app.state.pool, RUN_ID)
+    assert run is not None and run.status == "cancelled" and run.finished_at is not None
+
+
 async def test_health(api: httpx.AsyncClient) -> None:
     r = await api.get("/health")
 

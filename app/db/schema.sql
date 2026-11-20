@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS runs (
     streams_expired boolean NOT NULL DEFAULT false,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
+    started_at timestamptz,
+    finished_at timestamptz,
     CHECK ((status = 'failed') = (error_phase IS NOT NULL))
 );
 

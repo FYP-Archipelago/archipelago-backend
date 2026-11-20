@@ -36,6 +36,8 @@ class RunStatus(BaseModel):
     error: RunError | None
     created_at: datetime
     updated_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 class RunPage(BaseModel):
