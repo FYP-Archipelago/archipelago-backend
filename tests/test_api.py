@@ -1,6 +1,7 @@
 import asyncio
 import gzip
 import json
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -82,6 +83,32 @@ async def test_create_run_stores_the_settings_it_sends_to_the_runner(api: httpx.
     assert run["run_settings"] == BODY["run_settings"]
     assert (await api.get(f"/runs/{run['run_id']}")).json()["run_settings"] == BODY["run_settings"]
     assert runner.started == {"run_id": run["run_id"], "preset": BODY["preset"], "overrides": BODY["run_settings"]}
+
+
+async def test_rename_completed_run_preserves_settings_and_result(api: httpx.AsyncClient) -> None:
+    await seed_run("running")
+    stored_result = gzip.compress(b'{"graph": {}}')
+    await queries.save_result(app.state.pool, RUN_ID, stored_result)
+    path = f"/runs/{RUN_ID}"
+    before = (await api.get(path)).json()
+
+    response = await api.patch(path, json={"run_name": "  Renamed baseline  "})
+
+    assert response.status_code == 200
+    renamed = response.json()
+    assert renamed == {**before, "run_name": "Renamed baseline", "updated_at": renamed["updated_at"]}
+    assert datetime.fromisoformat(renamed["updated_at"]) > datetime.fromisoformat(before["updated_at"])
+    assert (await api.patch(path, json={"run_name": "Renamed baseline"})).json() == renamed
+    assert (await api.get(path)).json() == renamed
+    assert (await api.get("/runs")).json()["runs"] == [renamed]
+    assert await queries.get_result_body(app.state.pool, RUN_ID) == stored_result
+
+
+async def test_rename_run_rejects_changes_to_other_fields(api: httpx.AsyncClient) -> None:
+    await seed_run()
+    response = await api.patch(f"/runs/{RUN_ID}", json={"run_name": "Renamed baseline", "status": "done"})
+
+    assert response.status_code == 422
 
 
 async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:

@@ -19,7 +19,7 @@ from redis.exceptions import RedisError
 from app import __version__, runner
 from app.db import queries
 from app.ids import is_run_id, mint_run_id
-from app.models import CreateRun, RunPage, RunStatus, Status
+from app.models import CreateRun, RenameRun, RunPage, RunStatus, Status
 from app.redis_names import ERROR, FINAL, JOB_CONFIG, JOB_RUN_ID, JOB_STREAM, PENDING_RUNS, PHASE, UPDATE, clustered_key
 from app.runner import RunnerRejected, RunnerUnavailable
 from app.supervisor import start_supervisor, write_abort
@@ -118,6 +118,14 @@ async def list_runs(
 @router.get("/runs/{run_id}", response_model=RunStatus)
 async def get_run(run_id: str, request: Request) -> RunStatus:
     run = await queries.get_run(request.app.state.pool, run_id) if is_run_id(run_id) else None
+    if run is None:
+        raise HTTPException(404, "run not found")
+    return run
+
+
+@router.patch("/runs/{run_id}", response_model=RunStatus, responses={404: {"description": "Run not found"}})
+async def rename_run(run_id: str, body: RenameRun, request: Request) -> RunStatus:
+    run = await queries.rename_run(request.app.state.pool, run_id, body.run_name) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
     return run

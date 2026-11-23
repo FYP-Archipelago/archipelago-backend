@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 Status = Literal["queued", "running", "clustering", "done", "failed", "cancelling", "cancelled"]
 Phase = Literal["runner", "clustering", "internal"]
 
-RunName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+RunName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100, pattern=r"^[^\x00]+$")]
 
 
 class CreateRun(BaseModel):
@@ -18,6 +18,12 @@ class CreateRun(BaseModel):
     run_settings: dict[str, Any]
     stream: bool = False
     clustering: Config
+
+
+class RenameRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_name: RunName
 
 
 class RunError(BaseModel):

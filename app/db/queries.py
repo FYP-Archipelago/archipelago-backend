@@ -60,6 +60,18 @@ async def get_run(pool: AsyncConnectionPool, run_id: str) -> RunStatus | None:
     return _to_run_status(row) if row else None
 
 
+async def rename_run(pool: AsyncConnectionPool, run_id: str, run_name: str) -> RunStatus | None:
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "UPDATE runs SET run_name = %s, "
+            "updated_at = CASE WHEN run_name IS DISTINCT FROM %s THEN now() ELSE updated_at END "
+            "WHERE run_id = %s RETURNING *",
+            (run_name, run_name, run_id),
+        )
+        row = await cur.fetchone()
+    return _to_run_status(row) if row else None
+
+
 async def list_runs(
     pool: AsyncConnectionPool, limit: int, status: Status | None, preset: str | None, before: tuple[datetime, str] | None
 ) -> list[RunStatus]:

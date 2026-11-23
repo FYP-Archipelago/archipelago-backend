@@ -1,0 +1,22 @@
+meta {
+  name: Rename Run
+  type: http
+  seq: 9
+}
+
+patch {
+  url: {{base_url}}/runs/{{run_id}}
+  body: json
+  auth: none
+}
+
+headers {
+  Accept: application/json
+  Content-Type: application/json
+}
+
+body:json {
+  {
+    "run_name": "TSP Baseline"
+  }
+}
