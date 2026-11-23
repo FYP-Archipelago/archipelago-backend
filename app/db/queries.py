@@ -6,11 +6,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
-from app.models import CreateRun, Phase, RunError, RunStatus, Status
-
-SCHEMA_PATH = Path(__file__).with_name("schema.sql")
-ORDER: list[Status] = ["queued", "running", "clustering", "done"]
-PROGRESS_STATUSES = ["queued", "running", "clustering"]
+from app.models import FINISHED_STATUSES, PROGRESS_STATUSES, CreateRun, Phase, RunError, RunStatus, Status
 
 
 async def open_pool(url: str) -> AsyncConnectionPool:
@@ -21,7 +17,7 @@ async def open_pool(url: str) -> AsyncConnectionPool:
 
 async def apply_schema(pool: AsyncConnectionPool) -> None:
     async with pool.connection() as conn:
-        await conn.execute(SCHEMA_PATH.read_text())
+        await conn.execute(Path(__file__).with_name("schema.sql").read_text())
 
 
 def _to_run_status(row: dict[str, Any]) -> RunStatus:
@@ -72,6 +68,15 @@ async def rename_run(pool: AsyncConnectionPool, run_id: str, run_name: str) -> R
     return _to_run_status(row) if row else None
 
 
+async def delete_run(pool: AsyncConnectionPool, run_id: str) -> bool:
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "DELETE FROM runs WHERE run_id = %s AND status = ANY(%s) AND streams_expired",
+            (run_id, FINISHED_STATUSES),
+        )
+    return cur.rowcount == 1
+
+
 async def list_runs(
     pool: AsyncConnectionPool, limit: int, status: Status | None, preset: str | None, before: tuple[datetime, str] | None
 ) -> list[RunStatus]:
@@ -96,7 +101,9 @@ async def list_runs(
 
 
 async def advance_status(pool: AsyncConnectionPool, run_id: str, to: Status) -> None:
-    earlier = ORDER[: ORDER.index(to)]
+    # the forward path a run moves along; failed and cancelled are exits from it, not steps on it
+    order: list[Status] = ["queued", "running", "clustering", "done"]
+    earlier = order[: order.index(to)]
     # Any step after 'queued' means the run has started, even if it skips straight to clustering
     async with pool.connection() as conn:
         await conn.execute(

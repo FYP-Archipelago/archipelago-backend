@@ -7,6 +7,9 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 Status = Literal["queued", "running", "clustering", "done", "failed", "cancelling", "cancelled"]
 Phase = Literal["runner", "clustering", "internal"]
 
+PROGRESS_STATUSES: list[Status] = ["queued", "running", "clustering"]
+FINISHED_STATUSES: list[Status] = ["done", "failed", "cancelled"]
+
 RunName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100, pattern=r"^[^\x00]+$")]
 
 

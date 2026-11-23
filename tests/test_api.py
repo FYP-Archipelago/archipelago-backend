@@ -111,6 +111,64 @@ async def test_rename_run_rejects_changes_to_other_fields(api: httpx.AsyncClient
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("name", ["", "   ", "x" * 101, "bad\x00name"])
+async def test_rename_run_rejects_invalid_names_and_keeps_the_old_one(api: httpx.AsyncClient, name: str) -> None:
+    await seed_run()
+    path = f"/runs/{RUN_ID}"
+
+    response = await api.patch(path, json={"run_name": name})
+
+    assert response.status_code == 422
+    assert (await api.get(path)).json()["run_name"] == BODY["run_name"]
+
+
+@pytest.mark.parametrize("run_id", [RUN_ID, "not-a-run-id"])
+async def test_rename_and_delete_of_a_missing_run_return_not_found(api: httpx.AsyncClient, run_id: str) -> None:
+    assert (await api.patch(f"/runs/{run_id}", json={"run_name": "renamed"})).status_code == 404
+    assert (await api.delete(f"/runs/{run_id}")).status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        ("queued", "cancel the run before deleting it"),
+        ("running", "cancel the run before deleting it"),
+        ("clustering", "cancel the run before deleting it"),
+        ("cancelling", "run is still cancelling"),
+        ("failed", "run cleanup is still in progress"),
+    ],
+)
+async def test_delete_refuses_a_run_until_it_is_finished_and_cleaned_up(api: httpx.AsyncClient, runner: FakeRunner, status: str, detail: str) -> None:
+    await seed_run(status)
+    path = f"/runs/{RUN_ID}"
+
+    response = await api.delete(path)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == detail
+    assert (await api.get(path)).json()["status"] == status
+    assert runner.calls == []
+
+
+async def test_delete_finished_run_waits_for_cleanup_and_removes_result(api: httpx.AsyncClient) -> None:
+    await seed_run("running")
+    await queries.save_result(app.state.pool, RUN_ID, gzip.compress(b'{"graph": {}}'))
+    path = f"/runs/{RUN_ID}"
+
+    response = await api.delete(path)
+    assert response.status_code == 409
+    assert (await api.get(f"{path}/result")).status_code == 200
+
+    await queries.finish_cleanup(app.state.pool, RUN_ID)
+    response = await api.delete(path)
+
+    assert response.status_code == 204 and response.content == b""
+    assert (await api.get(path)).status_code == 404
+    assert (await api.get("/runs")).json()["runs"] == []
+    assert await queries.get_result_body(app.state.pool, RUN_ID) is None
+    assert (await api.delete(path)).status_code == 404
+
+
 async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:
     ids = [f"run-20261027T000000Z-{value:08x}" for value in range(1, 42)]
     for run_id in ids:
