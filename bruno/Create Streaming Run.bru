@@ -17,12 +17,16 @@ headers {
 
 body:json {
   {
+    "run_name": "TSP streaming",
     "preset": "ga_tsp",
-    "overrides": {
+    "run_settings": {
       "num_islands": 4,
       "evaluation_budget": 200000,
       "target_generations": 60,
       "migration.enabled": false,
+      "migration.topology": "lattice",
+      "migration.interval": 30,
+      "migration.num_migrants": 4,
       "seed": 7
     },
     "stream": true,

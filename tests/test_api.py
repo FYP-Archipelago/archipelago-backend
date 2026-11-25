@@ -1,6 +1,7 @@
 import asyncio
 import gzip
 import json
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -17,7 +18,13 @@ from tests.conftest import FakeRunner
 
 pytestmark = pytest.mark.anyio
 
-BODY: dict[str, Any] = {"preset": "de-rastrigin", "overrides": {"num_islands": 4}, "stream": True, "clustering": {"lsh": True}}
+BODY: dict[str, Any] = {
+    "run_name": "baseline",
+    "preset": "de-rastrigin",
+    "run_settings": {"num_islands": 4, "evaluation_budget": 10000, "migration.enabled": True},
+    "stream": True,
+    "clustering": {"lsh": True},
+}
 RUN_ID = "run-20261027T000000Z-0123abcd"
 
 
@@ -59,6 +66,109 @@ async def test_create_run_enqueues_the_job_before_starting_the_runner(api: httpx
     assert Config.model_validate_json(job[b"config"]) == Config(lsh=True)
 
 
+async def test_create_run_stores_the_trimmed_run_name(api: httpx.AsyncClient) -> None:
+    r = await api.post("/runs", json={**BODY, "run_name": "  baseline  "})
+
+    assert r.status_code == 202
+    assert r.json()["run_name"] == "baseline"
+    run = await queries.get_run(app.state.pool, r.json()["run_id"])
+    assert run is not None and run.run_name == "baseline"
+
+
+async def test_create_run_stores_the_settings_it_sends_to_the_runner(api: httpx.AsyncClient, runner: FakeRunner) -> None:
+    r = await api.post("/runs", json=BODY)
+
+    assert r.status_code == 202
+    run = r.json()
+    assert run["run_settings"] == BODY["run_settings"]
+    assert (await api.get(f"/runs/{run['run_id']}")).json()["run_settings"] == BODY["run_settings"]
+    assert runner.started == {"run_id": run["run_id"], "preset": BODY["preset"], "overrides": BODY["run_settings"]}
+
+
+async def test_rename_completed_run_preserves_settings_and_result(api: httpx.AsyncClient) -> None:
+    await seed_run("running")
+    stored_result = gzip.compress(b'{"graph": {}}')
+    await queries.save_result(app.state.pool, RUN_ID, stored_result)
+    path = f"/runs/{RUN_ID}"
+    before = (await api.get(path)).json()
+
+    response = await api.patch(path, json={"run_name": "  Renamed baseline  "})
+
+    assert response.status_code == 200
+    renamed = response.json()
+    assert renamed == {**before, "run_name": "Renamed baseline", "updated_at": renamed["updated_at"]}
+    assert datetime.fromisoformat(renamed["updated_at"]) > datetime.fromisoformat(before["updated_at"])
+    assert (await api.patch(path, json={"run_name": "Renamed baseline"})).json() == renamed
+    assert (await api.get(path)).json() == renamed
+    assert (await api.get("/runs")).json()["runs"] == [renamed]
+    assert await queries.get_result_body(app.state.pool, RUN_ID) == stored_result
+
+
+async def test_rename_run_rejects_changes_to_other_fields(api: httpx.AsyncClient) -> None:
+    await seed_run()
+    response = await api.patch(f"/runs/{RUN_ID}", json={"run_name": "Renamed baseline", "status": "done"})
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("name", ["", "   ", "x" * 101, "bad\x00name"])
+async def test_rename_run_rejects_invalid_names_and_keeps_the_old_one(api: httpx.AsyncClient, name: str) -> None:
+    await seed_run()
+    path = f"/runs/{RUN_ID}"
+
+    response = await api.patch(path, json={"run_name": name})
+
+    assert response.status_code == 422
+    assert (await api.get(path)).json()["run_name"] == BODY["run_name"]
+
+
+@pytest.mark.parametrize("run_id", [RUN_ID, "not-a-run-id"])
+async def test_rename_and_delete_of_a_missing_run_return_not_found(api: httpx.AsyncClient, run_id: str) -> None:
+    assert (await api.patch(f"/runs/{run_id}", json={"run_name": "renamed"})).status_code == 404
+    assert (await api.delete(f"/runs/{run_id}")).status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        ("queued", "cancel the run before deleting it"),
+        ("running", "cancel the run before deleting it"),
+        ("clustering", "cancel the run before deleting it"),
+        ("cancelling", "run is still cancelling"),
+        ("failed", "run cleanup is still in progress"),
+    ],
+)
+async def test_delete_refuses_a_run_until_it_is_finished_and_cleaned_up(api: httpx.AsyncClient, runner: FakeRunner, status: str, detail: str) -> None:
+    await seed_run(status)
+    path = f"/runs/{RUN_ID}"
+
+    response = await api.delete(path)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == detail
+    assert (await api.get(path)).json()["status"] == status
+    assert runner.calls == []
+
+
+async def test_delete_finished_run_waits_for_cleanup_and_removes_result(api: httpx.AsyncClient) -> None:
+    await seed_run("running")
+    await queries.save_result(app.state.pool, RUN_ID, gzip.compress(b'{"graph": {}}'))
+    path = f"/runs/{RUN_ID}"
+
+    response = await api.delete(path)
+    assert response.status_code == 409
+    assert (await api.get(f"{path}/result")).status_code == 200
+
+    await queries.finish_cleanup(app.state.pool, RUN_ID)
+    response = await api.delete(path)
+
+    assert response.status_code == 204 and response.content == b""
+    assert (await api.get(path)).status_code == 404
+    assert (await api.get("/runs")).json()["runs"] == []
+    assert await queries.get_result_body(app.state.pool, RUN_ID) is None
+    assert (await api.delete(path)).status_code == 404
+
+
 async def test_run_history_cursor_handles_tied_timestamps_and_new_runs(api: httpx.AsyncClient) -> None:
     ids = [f"run-20261027T000000Z-{value:08x}" for value in range(1, 42)]
     for run_id in ids:
@@ -91,7 +201,8 @@ async def test_run_history_filters_metadata_and_empty_page(api: httpx.AsyncClien
     assert response.status_code == 200
     [run] = response.json()["runs"]
     assert run["run_id"] == RUN_ID and run["status"] == "failed"
-    assert run["preset"] == BODY["preset"] and run["overrides"] == BODY["overrides"]
+    assert run["run_name"] == BODY["run_name"]
+    assert run["preset"] == BODY["preset"] and run["run_settings"] == BODY["run_settings"]
     assert run["stream"] is True and run["clustering"] == Config(lsh=True).model_dump(mode="json")
     assert run["error"] == {"phase": "clustering", "message": "boom"}
     assert runner.calls == []
@@ -163,6 +274,9 @@ async def test_failed_start_gives_502_and_fails_the_run(
     [
         {**BODY, "clustering": {}},
         {**BODY, "unknown": 1},
+        {key: value for key, value in BODY.items() if key != "run_name"},
+        {**BODY, "run_name": "   "},
+        {key: value for key, value in BODY.items() if key != "run_settings"},
     ],
 )
 async def test_invalid_body_is_rejected_before_anything_happens(
@@ -376,6 +490,32 @@ async def test_statuses_only_move_forward(api: httpx.AsyncClient) -> None:
     run = await queries.get_run(app.state.pool, RUN_ID)
     assert run is not None and run.status == "failed"
     assert await queries.get_result_body(app.state.pool, RUN_ID) is None
+
+
+async def test_records_when_a_run_starts_and_finishes(api: httpx.AsyncClient) -> None:
+    await seed_run()
+    queued = (await api.get(f"/runs/{RUN_ID}")).json()
+    assert queued["started_at"] is None and queued["finished_at"] is None
+
+    await queries.advance_status(app.state.pool, RUN_ID, "running")
+    started = (await api.get(f"/runs/{RUN_ID}")).json()["started_at"]
+    await queries.advance_status(app.state.pool, RUN_ID, "clustering")
+    clustering = (await api.get(f"/runs/{RUN_ID}")).json()
+    assert started is not None and clustering["started_at"] == started and clustering["finished_at"] is None
+
+    await queries.save_result(app.state.pool, RUN_ID, gzip.compress(b"{}"))
+    done = (await api.get(f"/runs/{RUN_ID}")).json()
+    assert done["started_at"] == started and done["finished_at"] >= started
+
+
+async def test_a_cancelled_run_finishes_when_it_stops_not_when_asked(api: httpx.AsyncClient) -> None:
+    await seed_run("cancelling")
+    cancelling = await queries.get_run(app.state.pool, RUN_ID)
+    assert cancelling is not None and cancelling.finished_at is None
+
+    await queries.finish_cleanup(app.state.pool, RUN_ID)
+    run = await queries.get_run(app.state.pool, RUN_ID)
+    assert run is not None and run.status == "cancelled" and run.finished_at is not None
 
 
 async def test_health(api: httpx.AsyncClient) -> None:

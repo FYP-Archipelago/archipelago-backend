@@ -19,7 +19,7 @@ from redis.exceptions import RedisError
 from app import __version__, runner
 from app.db import queries
 from app.ids import is_run_id, mint_run_id
-from app.models import CreateRun, RunPage, RunStatus, Status
+from app.models import FINISHED_STATUSES, CreateRun, RenameRun, RunPage, RunStatus, Status
 from app.redis_names import ERROR, FINAL, JOB_CONFIG, JOB_RUN_ID, JOB_STREAM, PENDING_RUNS, PHASE, UPDATE, clustered_key
 from app.runner import RunnerRejected, RunnerUnavailable
 from app.supervisor import start_supervisor, write_abort
@@ -81,7 +81,7 @@ async def create_run(body: CreateRun, request: Request) -> RunStatus:
         {JOB_RUN_ID: run.run_id, JOB_STREAM: "true" if run.stream else "false", JOB_CONFIG: run.clustering.model_dump_json()},
     )
     try:
-        started = await runner.start(state.runner, run.run_id, run.preset, run.overrides)
+        started = await runner.start(state.runner, run.run_id, run.preset, run.run_settings)
     except RunnerRejected as e:
         await queries.set_failed(state.pool, run.run_id, "runner", str(e))
         # a worker may already hold the job, and the abort makes it let go
@@ -123,13 +123,38 @@ async def get_run(run_id: str, request: Request) -> RunStatus:
     return run
 
 
+@router.patch("/runs/{run_id}", response_model=RunStatus, responses={404: {"description": "Run not found"}})
+async def rename_run(run_id: str, body: RenameRun, request: Request) -> RunStatus:
+    run = await queries.rename_run(request.app.state.pool, run_id, body.run_name) if is_run_id(run_id) else None
+    if run is None:
+        raise HTTPException(404, "run not found")
+    return run
+
+
+@router.delete(
+    "/runs/{run_id}",
+    status_code=204,
+    responses={404: {"description": "Run not found"}, 409: {"description": "Run is active, cancelling, or awaiting cleanup"}},
+)
+async def delete_run(run_id: str, request: Request) -> Response:
+    state: Any = request.app.state
+    if is_run_id(run_id) and await queries.delete_run(state.pool, run_id):
+        return Response(status_code=204)
+    run = await queries.get_run(state.pool, run_id) if is_run_id(run_id) else None
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if run.status in FINISHED_STATUSES:
+        raise HTTPException(409, "run cleanup is still in progress")
+    raise HTTPException(409, "run is still cancelling" if run.status == "cancelling" else "cancel the run before deleting it")
+
+
 @router.post("/runs/{run_id}/cancel", responses={202: {"model": RunStatus}})
 async def cancel_run(run_id: str, request: Request, response: Response) -> RunStatus:
     state: Any = request.app.state
     run = await queries.get_run(state.pool, run_id) if is_run_id(run_id) else None
     if run is None:
         raise HTTPException(404, "run not found")
-    if run.status in ("done", "failed", "cancelled"):
+    if run.status in FINISHED_STATUSES:
         return run
     if run.status != "cancelling":
         await queries.set_cancelling(state.pool, run_id)
@@ -184,8 +209,10 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                         yield _sse("update", fields[UPDATE], entry_id)
                     elif FINAL in fields or (PHASE in fields and ERROR in fields):
                         current = await queries.get_run(state.pool, run_id)
+                        if current is None:
+                            return
                         # Cancellation acknowledgements and late results do not end an unfinished cancellation.
-                        if current is not None and current.status in ("cancelling", "cancelled"):
+                        if current.status in ("cancelling", "cancelled"):
                             if current.status != status:
                                 status = current.status
                                 yield _sse("status", json.dumps({"status": status}).encode())
@@ -196,7 +223,7 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
                             yield _sse("error", json.dumps({"phase": fields[PHASE].decode(), "message": fields[ERROR].decode()}).encode())
                             return
                         # a run the backend already failed has no result, so /result would answer 404
-                        if current is not None and current.error is not None:
+                        if current.error is not None:
                             yield _sse("error", current.error.model_dump_json().encode())
                             return
                         yield _sse("final", fields[FINAL], entry_id)
